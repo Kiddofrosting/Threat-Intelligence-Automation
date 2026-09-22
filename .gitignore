@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# Generated artifacts (keep folders, ignore cache contents)
+cache/*/*.json
+# NOTE: reports/security_report.md is a required deliverable and is
+# intentionally NOT ignored — it should be committed to the repo.
+
+# OS
+.DS_Store
