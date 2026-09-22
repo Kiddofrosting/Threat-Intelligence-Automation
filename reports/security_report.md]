@@ -1,0 +1,210 @@
+# Threat Intelligence & Network Security Analysis Report
+
+- **PCAP file:** `pcaps/sample.pcap`
+- **Analysis date:** 2026-09-22 23:26 UTC
+- **Tool:** Threat Intelligence Automation Tool v2.0.0
+- **Analyst:** SOC Analyst
+
+---
+
+## 1. Executive Summary
+
+**Status:** LOW-SEVERITY ACTIVITY OBSERVED
+
+- Packets analyzed: 4
+- Unique source IPs: 3
+- Unique destination IPs: 3
+- Unique public IP indicators: 2
+- Unique domains: 1
+- IOCs extracted: 7
+- Detection signals raised: 5 (5 active, 0 suppressed by allowlist)
+- Correlated findings: 1
+
+**Findings by severity**
+
+| Severity | Count |
+|---|---|
+| Medium | 1 |
+
+
+## 2. Key Findings
+
+Only correlated, evidence-backed findings are shown here. Every finding combines behavioral detection signals and/or threat-intelligence evidence -- a domain, IP or hash observed with no corroborating evidence appears only in the IOC inventory (Section 6), not here.
+
+### F-001 — Suspicious Payload Retrieval
+
+- **Severity:** Medium &nbsp;|&nbsp; **Confidence:** High &nbsp;|&nbsp; **Risk score:** 60/100
+- **Affected endpoint(s):** 192.168.1.50 (asset role: Unknown)
+- **Destinations:** 185.123.45.67
+- **Domain(s):** qowietuxzpalskd.top
+- **Hash(es):** aac46c46970cb326...
+- **First/last seen:** 10:57:15 – 10:57:18 (3 occurrence(s))
+- **Detection rule(s):** DNS-003, FILE-001, HTTP-001, HTTP-003, HTTP-004
+
+**Why this matters:** 192.168.1.50 queried qowietuxzpalskd.top 1 time(s). HTTP activity was observed to qowietuxzpalskd.top. 1 distinct payload(s) were transferred, 1 with a recognizable file signature. Local detection rule(s) DNS-003, FILE-001, HTTP-001, HTTP-003, HTTP-004 fired for this activity. Threat-intelligence assessment: CLEAN. Risk score 60/100 (Reputation 0, Behavior 30, Payload 20, Network context 10, Asset context 0 — asset role unknown).
+
+**Key evidence:**
+- 217-byte payload transferred 1 time(s) (185.123.45.67 -> 192.168.1.50), signature: PE executable / DLL, SHA256 aac46c46970cb326...
+- DGA heuristic score: 50/100 (confidence: Medium)
+- GET request(s) for /payload.exe from host qowietuxzpalskd.top, User-Agent: python-requests/2.31.0
+- User-Agent 'python-requests/2.31.0' used for 1 request(s) to qowietuxzpalskd.top
+- qowietuxzpalskd.top was contacted only 1 time(s) across the entire capture.
+
+**Threat intelligence:**
+- AbuseIPDB abuse confidence 0/100 from 0 report(s), no reported date on file. Interpreted as Clean.
+- VirusTotal: 0/89 vendor(s) flagged malicious, 0 suspicious. Interpreted as Clean.
+
+## 3. Investigation Recommendations
+
+**F-001 — Suspicious Payload Retrieval:**
+- Investigate endpoint 192.168.1.50 for signs of compromise.
+- Review historical DNS logs for qowietuxzpalskd.top across the environment.
+- Search EDR/AV for SHA256 aac46c46970cb32625e29a316c7de0af1e02cd512e3f245e313d37af991ceb68.
+- Analyze the recovered payload in an isolated sandbox before further action.
+- Search proxy/web logs for prior connections to qowietuxzpalskd.top.
+
+## 4. Attack / Behavior Story
+
+**F-001 — Suspicious Payload Retrieval**
+
+```
+DNS (qowietuxzpalskd.top)
+  ↓
+HTTP connection (qowietuxzpalskd.top)
+  ↓
+File transfer (PE executable / DLL)
+  ↓
+Threat Intelligence
+```
+
+## 5. Technical Evidence
+
+Raw observations: 2 DNS record(s), 1 HTTP record(s), 1 file transfer(s) — aggregated below into 1 DNS behavioral event(s), 1 HTTP behavioral event(s) and 1 distinct file behavioral event(s).
+
+### Protocol / traffic distribution
+
+| Protocol | Packet Count |
+|---|---|
+| UDP | 2 |
+| TCP | 2 |
+
+### DNS behavioral events
+
+| Source | Domain | Type | Occurrences | NXDOMAIN % | Resolved IP(s) | First seen | Last seen |
+|---|---|---|---|---|---|---|---|
+| 192.168.1.50 | qowietuxzpalskd.top | A | 1 | 0% | 185.123.45.67 | 10:57:15 | 10:57:15 |
+
+### HTTP behavioral events
+
+| Source | Destination | Host | Requests | Path(s) | User-Agent |
+|---|---|---|---|---|---|
+| 192.168.1.50 | 185.123.45.67 | qowietuxzpalskd.top | 1 | /payload.exe | python-requests/2.31.0 |
+
+### File transfer behavioral events
+
+| Source | Destination | Size (bytes) | Signature | Transfers | SHA256 |
+|---|---|---|---|---|---|
+| 185.123.45.67 | 192.168.1.50 | 217 | PE executable / DLL | 1 | aac46c46970cb32625e29a316c7de0af1e02cd512e3f245e313d37af991ceb68 |
+
+### Investigation timeline
+
+| Timestamp (UTC) | Behavioral event | Related finding |
+|---|---|---|
+| 10:57:15 | 192.168.1.50 queried qowietuxzpalskd.top (1 time(s), 10:57:15–10:57:15) | F-001 |
+| 10:57:17 | 192.168.1.50 → 185.123.45.67 HTTP activity to qowietuxzpalskd.top (1 request(s): /payload.exe) | F-001 |
+| 10:57:18 | Payload transferred 185.123.45.67 → 192.168.1.50 (PE executable / DLL, SHA256 aac46c46970cb326...) | F-001 |
+
+## 6. IOC Inventory
+
+This inventory lists every indicator extracted from the capture. Listing an indicator here does **not** imply it is malicious -- see the significance tier and Section 2 for which indicators actually became findings.
+
+| Tier | Count |
+|---|---|
+| Insignificant | 5 |
+| Noteworthy | 1 |
+| Suspicious | 1 |
+| High-Priority | 0 |
+
+
+**Noteworthy and above:**
+
+| Indicator | Type | Tier | Significance | Detection rule(s) | TI state(s) |
+|---|---|---|---|---|---|
+| qowietuxzpalskd.top | domain | suspicious | 37 | DNS-003, HTTP-001, HTTP-003, HTTP-004 | - |
+
+## 7. Appendix
+
+### 7.1 Threat-intelligence summary
+
+- Indicators analyzed: 7
+- Meaningful TI matches (Suspicious/Malicious): 0
+- Weak reputation (not a finding on its own): 1
+- Clean / no meaningful record: 12
+
+### 7.2 Raw threat-intelligence results (including no-record lookups)
+
+| IOC | Feed | State | Confidence | Summary |
+|---|---|---|---|---|
+| 185.123.45.67 | AbuseIPDB | CLEAN | High | AbuseIPDB abuse confidence 0/100 from 0 report(s), no reported date on file. Interpreted as Clean. |
+| 185.123.45.67 | VirusTotal | CLEAN | High | VirusTotal: 0/89 vendor(s) flagged malicious, 0 suspicious. Interpreted as Clean. |
+| 185.123.45.67 | URLhaus | UNKNOWN | Low | No URLhaus record found for this indicator. |
+| 8.8.8.8 | AbuseIPDB | WEAK_REPUTATION | Low | AbuseIPDB abuse confidence 0/100 from 202 report(s), last reported 1d ago. Interpreted as Weak Reputation. |
+| 8.8.8.8 | VirusTotal | CLEAN | High | VirusTotal: 0/89 vendor(s) flagged malicious, 0 suspicious. Interpreted as Clean. |
+| 8.8.8.8 | URLhaus | UNKNOWN | Low | No URLhaus record found for this indicator. |
+| qowietuxzpalskd.top | VirusTotal | UNKNOWN | Low | VirusTotal: 0/0 vendor(s) flagged malicious, 0 suspicious. Interpreted as Unknown. |
+| qowietuxzpalskd.top | URLhaus | UNKNOWN | Low | No URLhaus record found for this indicator. |
+| eab814ca3f9dc62be681d71d2f6f9f85 | VirusTotal | UNKNOWN | Low | VirusTotal: 0/0 vendor(s) flagged malicious, 0 suspicious. Interpreted as Unknown. |
+| eefebe7d219e9e0b4bbc29babc3eef7281b379a6 | VirusTotal | UNKNOWN | Low | VirusTotal: 0/0 vendor(s) flagged malicious, 0 suspicious. Interpreted as Unknown. |
+| aac46c46970cb32625e29a316c7de0af1e02cd512e3f245e313d37af991ceb68 | VirusTotal | UNKNOWN | Low | VirusTotal: 0/0 vendor(s) flagged malicious, 0 suspicious. Interpreted as Unknown. |
+| http://qowietuxzpalskd.top/payload.exe | VirusTotal | UNKNOWN | Low | VirusTotal: 0/0 vendor(s) flagged malicious, 0 suspicious. Interpreted as Unknown. |
+| http://qowietuxzpalskd.top/payload.exe | URLhaus | UNKNOWN | Low | No URLhaus record found for this indicator. |
+
+### 7.3 Suppressed and low-confidence detection signals
+
+No detection signals were suppressed by the allowlist in this run.
+
+### 7.4 Detection tuning report
+
+| Rule | Title | Triggered | Suppressed | In findings | Avg. confidence | Avg. score |
+|---|---|---|---|---|---|---|
+| DNS-003 | Potential Algorithmically Generated Domain | 1 | 0 | 1 | Medium | 10.0 |
+| FILE-001 | Suspicious File Signature | 1 | 0 | 1 | Medium | 15.0 |
+| HTTP-001 | Suspicious Executable Download | 1 | 0 | 1 | Medium | 20.0 |
+| HTTP-003 | Suspicious User-Agent | 1 | 0 | 1 | Low | 4.0 |
+| HTTP-004 | Rare External Host | 1 | 0 | 1 | Low | 2.0 |
+
+### 7.5 Observability / pipeline statistics
+
+| Metric | Count |
+|---|---|
+| Raw packets | 4 |
+| Raw DNS observations | 2 |
+| Raw HTTP observations | 1 |
+| Raw file observations | 1 |
+| Behavioral events (DNS) | 1 |
+| Behavioral events (HTTP) | 1 |
+| Behavioral events (File) | 1 |
+| Detection signals raised | 5 |
+| Detection signals suppressed | 0 |
+| Correlation candidates evaluated | 1 |
+| Findings before deduplication | 1 |
+| Findings after deduplication | 1 |
+
+### 7.6 Limitations
+
+- Encrypted traffic cannot be inspected beyond metadata.
+- DNS response data (resolved IPs, response codes) is merged into every client bucket for the same (domain, query type) pair, since this layer does not retain DNS transaction IDs; captures with multiple distinct clients querying the same domain in the same run may see resolved-IP data shared across those clients' behavioral events.
+- The apex-domain grouping used for DNS-007 is a last-two-labels approximation and is not authoritative for multi-part TLDs (e.g. .co.uk).
+- Asset role/criticality context is not available in this environment; every finding explicitly reports 'Asset role: Unknown' rather than guessing at criticality.
+- Threat-intelligence feeds are rate-limited and may be unavailable at scan time; the report states this explicitly rather than treating an unavailable feed as a clean result.
+- The risk score is a project-defined prioritization aid, not an industry-standard rating, and a single indicator match is never proof of compromise on its own.
+
+### 7.7 References
+
+- AbuseIPDB — <https://www.abuseipdb.com>
+- VirusTotal — <https://www.virustotal.com>
+- URLhaus (abuse.ch) — <https://urlhaus.abuse.ch>
+
+## Conclusion
+
+This analysis identified findings of Low or Medium severity only. None reached High or Critical severity; the correlated evidence above warrants routine follow-up consistent with local SOC procedure.

@@ -1,0 +1,104 @@
+# Detection, correlation and risk-scoring thresholds.
+#
+# Everything here can be tuned without touching code. Values shown are
+# the shipped defaults (analyzer/config.py falls back to the same
+# values if this file is missing or fails to parse, so the tool never
+# crashes on a bad/missing config).
+
+dns:
+  # A label shorter than this is never evaluated for DGA-likeness --
+  # short labels produce too many false signals either way.
+  dga_min_label_length: 8
+  # Minimum composite DGA heuristic score (0-100) before a DNS-003
+  # signal is even raised. Below this, the domain is not flagged at all.
+  dga_flag_threshold: 30
+  # DNS-001: a single (source, domain, query type) tuple queried at
+  # least this many times becomes "excessive frequency".
+  excessive_query_threshold: 8
+  # DNS-002: minimum NXDOMAIN ratio for a domain to be flagged...
+  nxdomain_ratio_threshold: 0.5
+  # ...but only once it has been queried at least this many times
+  # (a single NXDOMAIN is normal noise, not a signal).
+  nxdomain_min_occurrences: 4
+  # DNS-007: number of distinct subdomains observed under the same
+  # apex/registrable domain before "excessive unique subdomains" fires.
+  excessive_subdomain_threshold: 6
+
+http:
+  suspicious_extensions:
+    - .exe
+    - .dll
+    - .scr
+    - .bat
+    - .ps1
+    - .vbs
+    - .js
+    - .jar
+    - .hta
+    - .cpl
+    - .msi
+  script_extensions:
+    - .ps1
+    - .vbs
+    - .js
+    - .bat
+    - .hta
+  suspicious_user_agents:
+    - curl
+    - wget
+    - python-requests
+    - powershell
+    - certutil
+    - bitsadmin
+    - python-urllib
+    - go-http-client
+    - libwww-perl
+    - nikto
+    - masscan
+    - nmap
+  # HTTP-004: a destination host requested this many times or fewer
+  # (and not allowlisted) is treated as "rare" -- a weak signal only.
+  rare_host_occurrence_threshold: 2
+  # HTTP-007: number of transfers of the *same* payload/path before it
+  # is called "repeated payload retrieval".
+  repeated_payload_threshold: 3
+
+ti:
+  abuseipdb:
+    malicious_score: 75
+    suspicious_score: 25
+    stale_after_days: 365
+  virustotal:
+    malicious_vendor_count: 5
+    weak_single_hit_min_total: 30
+  urlhaus:
+    stale_after_days: 730
+
+risk:
+  # Maximum points each dimension can contribute. Must sum to 100.
+  weights:
+    reputation: 30
+    behavior: 30
+    payload: 20
+    network_context: 10
+    asset_context: 10
+  # Minimum total score to reach each severity band.
+  severity_bands:
+    Critical: 85
+    High: 65
+    Medium: 40
+    Low: 20
+  caps:
+    # A finding with no threat-intelligence corroboration and no
+    # payload evidence -- local heuristics only -- can never be rated
+    # above this, regardless of the arithmetic total.
+    behavior_only_max_severity: Medium
+
+correlation:
+  # Observations within this many seconds of each other, for the same
+  # endpoint, are considered part of the same candidate incident.
+  time_window_seconds: 900
+  # Findings for the same endpoint + indicator set that recur within
+  # this many seconds are merged (occurrence counts combined) rather
+  # than reported as separate findings.
+  dedup_time_bucket_seconds: 3600

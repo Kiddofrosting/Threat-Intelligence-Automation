@@ -38,6 +38,8 @@ class AbuseIPDBClient(BaseFeedClient):
                      f"ISP: {data.get('isp', 'N/A')}. "
                      f"Last reported: {data.get('lastReportedAt', 'never')}."),
             raw={"abuseConfidenceScore": score, "totalReports": reports,
+                 "numDistinctUsers": data.get("numDistinctUsers"),
                  "countryCode": data.get("countryCode"), "isp": data.get("isp"),
+                 "usageType": data.get("usageType"),
                  "lastReportedAt": data.get("lastReportedAt")},
         )

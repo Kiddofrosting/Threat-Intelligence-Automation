@@ -1,0 +1,41 @@
+# Known-legitimate infrastructure and tooling.
+#
+# Matching an entry here does not delete evidence -- it marks the
+# detection signal as suppressed (with a reason and the matched entry
+# recorded) so it stays visible in the technical appendix and the rule
+# tuning report, but is excluded from correlated findings and risk
+# scoring. Add to these lists rather than editing detector logic.
+
+domains:
+  # Major cloud/CDN providers. Contextual evidence (executable
+  # downloads, TI hits, suspicious paths) can still surface a finding
+  # even for a domain listed here -- this suppresses only the *weak*
+  # heuristic signals (suspicious TLD look-alikes, generic rarity),
+  # never a payload or TI-backed signal.
+  - microsoft.com
+  - windowsupdate.com
+  - msftconnecttest.com
+  - akamai.net
+  - akamaiedge.net
+  - akadns.net
+  - googleapis.com
+  - google.com
+  - gstatic.com
+  - cloudflare.com
+  - cloudfront.net
+  - amazonaws.com
+  - azureedge.net
+  - azure.com
+  - apple.com
+  - icloud.com
+
+ips: []
+
+# Substrings of User-Agent headers that are approved automation/tools
+# for this environment (e.g. an internal scanner or monitoring agent).
+# Empty by default -- add your own approved tools here.
+user_agents: []
+
+# Internal hosts that are known infrastructure (not "suspicious rare
+# destination" candidates) -- e.g. an internal proxy or update server.
+internal_hosts: []

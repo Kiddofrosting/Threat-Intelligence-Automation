@@ -48,6 +48,7 @@ class DNSRecord:
     query_type: Optional[str]
     is_response: bool
     resolved_ips: List[str] = field(default_factory=list)
+    response_code: Optional[str] = None  # NOERROR / NXDOMAIN / SERVFAIL / ... (responses only)
 
 
 @dataclass
@@ -74,6 +75,7 @@ class ExtractedFile:
     filename: Optional[str]
     size: int
     data: bytes
+    timestamp: datetime  # evidence timestamp from the capture, never processing time
 
 
 @dataclass
@@ -93,6 +95,7 @@ class ParsedCapture:
 
 
 DNS_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"}
+DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
 
 
 def _pkt_time(pkt) -> datetime:
@@ -146,6 +149,13 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                     query_type = DNS_QTYPES.get(int(pkt[DNSQR].qtype), str(pkt[DNSQR].qtype))
                 except Exception:
                     pass
+            response_code = None
+            if is_response:
+                try:
+                    response_code = DNS_RCODES.get(int(dns_layer.rcode), str(dns_layer.rcode))
+                except Exception:
+                    pass
+
             resolved = []
             if is_response and dns_layer.ancount:
                 an = dns_layer.an
@@ -168,6 +178,7 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                 query_type=query_type,
                 is_response=is_response,
                 resolved_ips=[ip for ip in resolved if ip],
+                response_code=response_code,
             ))
 
         # --- HTTP (Scapy's http layer, when it recognises the stream) ---
@@ -212,6 +223,7 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                     filename=None,
                     size=len(payload),
                     data=payload,
+                    timestamp=ts,
                 ))
 
     if logger:

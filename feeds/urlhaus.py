@@ -57,6 +57,10 @@ class URLhausClient(BaseFeedClient):
 
         urls = data.get("urls", [data]) if "urls" in data else [data]
         threat_types = sorted({u.get("threat", "unknown") for u in urls if u.get("threat")})
+        # Most-recent entry drives status/recency -- URLhaus returns
+        # newest-first, but sort defensively on date_added just in case.
+        dated = sorted(urls, key=lambda u: u.get("date_added") or "", reverse=True)
+        newest = dated[0] if dated else {}
 
         return FeedResult(
             feed=self.name,
@@ -66,5 +70,11 @@ class URLhausClient(BaseFeedClient):
             confidence="High",
             summary=(f"URLhaus lists this indicator as associated with malware "
                      f"distribution ({', '.join(threat_types) or 'type unspecified'})."),
-            raw={"threat_types": threat_types, "url_count": len(urls)},
+            raw={
+                "threat_types": threat_types,
+                "url_count": len(urls),
+                "url_status": newest.get("url_status"),
+                "date_added": newest.get("date_added") or data.get("firstseen"),
+                "tags": newest.get("tags", []),
+            },
         )

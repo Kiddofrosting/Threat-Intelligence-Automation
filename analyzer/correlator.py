@@ -1,170 +1,464 @@
 """Correlation engine.
 
-This is the heart of the tool: it does not just dump API results next
-to packet data, it links PCAP evidence + local detections + threat-intel
-results for the same IOC into a single structured Finding, and builds
-the chronological investigation timeline used in the report.
+This is the heart of the tool. It does not build one Finding per IOC
+-- it groups DNS, HTTP and file behavioral events by *source endpoint
+and time window* into candidate incident chains (DNS -> connection ->
+HTTP -> payload -> threat intelligence), and only promotes a chain to
+a Finding when it is backed by a non-suppressed local detection signal
+or a meaningful (SUSPICIOUS/MALICIOUS) threat-intelligence assessment.
+Weak-reputation-only or no-record TI results never become findings on
+their own.
+
+Risk scoring is split into five capped dimensions (reputation,
+behavior, payload, network context, asset context) specifically so
+that many small correlated signals about the *same* underlying
+behaviour cannot be added up into an inflated score, and so a weak
+local heuristic alone can never reach a high severity band.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Tuple
 
-from analyzer.detector import Detection, CONFIRMED_MALICIOUS, HIGH_CONFIDENCE_SUSPICIOUS
+from analyzer.aggregator import AggregationResult, DNSBehavior, FileBehavior, HTTPBehavior
+from analyzer.config import DEFAULT_CONFIG, band_from_score, min_severity
+from analyzer.detector import DetectionSignal
 from analyzer.ioc_extractor import IOC
 from analyzer.pcap_parser import ParsedCapture
+from analyzer.ti_interpreter import MALICIOUS, SUSPICIOUS, TIAssessment, interpret
 from feeds.base import FeedResult
-
-# --- Risk scoring -----------------------------------------------------
-# A simple, transparent, PROJECT-DEFINED score. It is a prioritization
-# aid, not proof of compromise and not an industry-standard methodology.
-SCORE_WEIGHTS = {
-    "ti_match": 25,            # any single feed reports the indicator
-    "ti_match_multi": 20,      # extra weight if 2+ feeds independently match
-    "high_confidence_ti": 15,  # a feed reports High confidence
-    "suspicious_ua": 10,
-    "suspicious_download": 20,
-    "suspicious_dns": 10,
-    "file_signature": 15,
-}
-
-
-def risk_band(score: int) -> str:
-    if score >= 90:
-        return "Critical"
-    if score >= 70:
-        return "High"
-    if score >= 40:
-        return "Medium"
-    if score >= 20:
-        return "Low"
-    return "Informational"
 
 
 @dataclass
 class TimelineEvent:
     timestamp: datetime
     description: str
+    finding_id: Optional[str] = None
 
 
 @dataclass
 class Finding:
     finding_id: str
-    ioc: str
-    ioc_type: str
+    title: str
+    category: str
     severity: str
     confidence: str
-    category: str
     risk_score: int
-    pcap_evidence: List[str] = field(default_factory=list)
-    ti_evidence: List[str] = field(default_factory=list)
-    correlation_summary: str = ""
-    recommended_action: str = ""
+    affected_assets: List[str] = field(default_factory=list)
+    source_ips: List[str] = field(default_factory=list)
+    destination_ips: List[str] = field(default_factory=list)
+    domains: List[str] = field(default_factory=list)
+    hashes: List[str] = field(default_factory=list)
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    occurrence_count: int = 0
+    detection_signals: List[DetectionSignal] = field(default_factory=list)
+    evidence: List[str] = field(default_factory=list)
+    threat_intelligence: List[str] = field(default_factory=list)
+    explanation: str = ""
+    recommended_actions: List[str] = field(default_factory=list)
+    event_chain: Optional[str] = None
 
 
-def build_timeline(capture: ParsedCapture) -> List[TimelineEvent]:
-    events: List[TimelineEvent] = []
-    for rec in capture.dns_records:
-        if rec.query and not rec.is_response:
-            events.append(TimelineEvent(rec.timestamp, f"DNS query for {rec.query}"))
-        if rec.is_response and rec.resolved_ips:
-            events.append(TimelineEvent(
-                rec.timestamp,
-                f"{rec.query or 'Query'} resolved to {', '.join(rec.resolved_ips)}"))
-    for rec in capture.http_records:
-        if rec.method and rec.path:
-            events.append(TimelineEvent(
-                rec.timestamp, f"{rec.method} {rec.path} to host {rec.host or rec.dst_ip}"))
-        if rec.status_code:
-            events.append(TimelineEvent(rec.timestamp, f"HTTP response {rec.status_code}"))
-    events.sort(key=lambda e: e.timestamp)
-    return events
+@dataclass
+class _Candidate:
+    endpoint: str
+    dns_event: Optional[DNSBehavior] = None
+    http_events: List[HTTPBehavior] = field(default_factory=list)
+    file_events: List[FileBehavior] = field(default_factory=list)
+
+
+def interpret_ti_results(ti_results: Dict[str, List[FeedResult]],
+                          config: dict) -> Dict[str, List[TIAssessment]]:
+    """Run every raw FeedResult through the feed-specific interpreter."""
+    ti_cfg = config.get("ti", DEFAULT_CONFIG["ti"])
+    assessments: Dict[str, List[TIAssessment]] = {}
+    for indicator, results in ti_results.items():
+        assessments[indicator] = [interpret(r, {"ti": ti_cfg}) for r in results]
+    return assessments
+
+
+def _build_candidates(aggregation: AggregationResult) -> List[_Candidate]:
+    dns_events = aggregation.dns_events
+    http_events = aggregation.http_events
+    file_events = aggregation.file_events
+
+    endpoints: Set[str] = set()
+    endpoints.update(ev.source_ip for ev in dns_events)
+    endpoints.update(ev.source_ip for ev in http_events)
+    http_dest_ips = {ev.dest_ip for ev in http_events}
+    for f in file_events:
+        # The file's "endpoint" is whichever side already appears as a
+        # client elsewhere in this capture (i.e. is doing the querying);
+        # default to the receiving side when neither is already known.
+        if f.dst_ip in endpoints or f.dst_ip not in http_dest_ips:
+            endpoints.add(f.dst_ip)
+        else:
+            endpoints.add(f.src_ip)
+
+    candidates: List[_Candidate] = []
+    used_http: Set[int] = set()
+    used_file: Set[int] = set()
+
+    for endpoint in sorted(endpoints):
+        endpoint_dns = [d for d in dns_events if d.source_ip == endpoint]
+        endpoint_http = [h for h in http_events if h.source_ip == endpoint]
+        endpoint_file = [f for f in file_events if f.dst_ip == endpoint or f.src_ip == endpoint]
+
+        for dns_ev in endpoint_dns:
+            cand = _Candidate(endpoint=endpoint, dns_event=dns_ev)
+            for h in endpoint_http:
+                if id(h) in used_http:
+                    continue
+                if h.host.lower() == dns_ev.domain or h.dest_ip in dns_ev.resolved_ips:
+                    used_http.add(id(h))
+                    cand.http_events.append(h)
+                    for f in endpoint_file:
+                        if id(f) in used_file:
+                            continue
+                        if f.dst_ip == h.dest_ip or f.src_ip == h.dest_ip:
+                            used_file.add(id(f))
+                            cand.file_events.append(f)
+            candidates.append(cand)
+
+        for h in endpoint_http:
+            if id(h) in used_http:
+                continue
+            used_http.add(id(h))
+            cand = _Candidate(endpoint=endpoint, http_events=[h])
+            for f in endpoint_file:
+                if id(f) in used_file:
+                    continue
+                if f.dst_ip == h.dest_ip or f.src_ip == h.dest_ip:
+                    used_file.add(id(f))
+                    cand.file_events.append(f)
+            candidates.append(cand)
+
+        for f in endpoint_file:
+            if id(f) in used_file:
+                continue
+            used_file.add(id(f))
+            candidates.append(_Candidate(endpoint=endpoint, file_events=[f]))
+
+    return candidates
+
+
+def _candidate_indicators(cand: _Candidate) -> Set[str]:
+    indicators: Set[str] = set()
+    if cand.dns_event:
+        indicators.add(cand.dns_event.domain)
+        indicators.update(cand.dns_event.resolved_ips)
+    for h in cand.http_events:
+        indicators.add(h.host)
+        indicators.add(h.dest_ip)
+    for f in cand.file_events:
+        indicators.add(f.sha256)
+        indicators.add(f.md5)
+        indicators.add(f.sha1)
+    return indicators
+
+
+def _timestamps(cand: _Candidate) -> Tuple[Optional[datetime], Optional[datetime]]:
+    times: List[datetime] = []
+    if cand.dns_event:
+        times += [cand.dns_event.first_seen, cand.dns_event.last_seen]
+    for h in cand.http_events:
+        times += [h.first_seen, h.last_seen]
+    for f in cand.file_events:
+        times += [f.first_seen, f.last_seen]
+    if not times:
+        return None, None
+    return min(times), max(times)
+
+
+def _event_chain(cand: _Candidate) -> Optional[str]:
+    stages = []
+    if cand.dns_event:
+        stages.append(f"DNS ({cand.dns_event.domain})")
+    if cand.http_events:
+        hosts = ", ".join(sorted({h.host for h in cand.http_events}))
+        stages.append(f"HTTP connection ({hosts})")
+    if cand.file_events:
+        sigs = ", ".join(sorted({f.signature or "unrecognized payload" for f in cand.file_events}))
+        stages.append(f"File transfer ({sigs})")
+    if len(stages) < 2:
+        return None
+    return "\n  \u2193\n".join(stages)
+
+
+def _title_for(cand: _Candidate, ti_meaningful: bool, ti_malicious: bool,
+                has_signature: bool, dga_flagged: bool) -> Tuple[str, str]:
+    if cand.file_events and (ti_malicious or has_signature):
+        return "Suspicious Payload Retrieval", "Payload Delivery"
+    if cand.dns_event and dga_flagged:
+        return f"Potential DGA Domain Activity — {cand.dns_event.domain}", "DNS Behavior"
+    if cand.http_events and ti_meaningful:
+        host = sorted({h.host for h in cand.http_events})[0]
+        return f"Suspicious Connection to {host}", "Network Connection"
+    if ti_meaningful:
+        return "Threat Intelligence Match", "Threat Intelligence"
+    return "Suspicious Network Activity", "Behavioral"
 
 
 def correlate(
     capture: ParsedCapture,
     iocs: List[IOC],
-    detections: List[Detection],
+    aggregation: AggregationResult,
+    detections: List[DetectionSignal],
     ti_results: Dict[str, List[FeedResult]],
-) -> List[Finding]:
-    """Build one Finding per IOC that has either a local detection or a
-    threat-intelligence match attached to it. IOCs with neither are left
-    out of the findings list (they still appear in the IOC inventory)."""
+    config: Optional[dict] = None,
+) -> Tuple[List[Finding], dict]:
+    """Returns (findings, stats). `stats` carries observability counters
+    (candidates evaluated, findings before/after deduplication) used by
+    the detection-tuning report; see analyzer/reporter.py."""
+    config = config or DEFAULT_CONFIG
+    risk_cfg = config["risk"]
+    bands = risk_cfg["severity_bands"]
+    caps = risk_cfg["caps"]
 
+    ti_assessments = interpret_ti_results(ti_results, config)
+
+    active_by_indicator: Dict[str, List[DetectionSignal]] = defaultdict(list)
+    for det in detections:
+        if not det.suppressed:
+            active_by_indicator[det.indicator].append(det)
+
+    candidates = _build_candidates(aggregation)
     findings: List[Finding] = []
     counter = 0
 
-    detections_by_ioc: Dict[str, List[Detection]] = {}
-    for det in detections:
-        if det.ioc:
-            detections_by_ioc.setdefault(det.ioc, []).append(det)
+    for cand in candidates:
+        indicators = _candidate_indicators(cand)
+        sig_list: List[DetectionSignal] = []
+        seen_sig_keys: Set[Tuple[str, str]] = set()
+        for ind in indicators:
+            for det in active_by_indicator.get(ind, []):
+                key = (det.rule_id, det.indicator)
+                if key not in seen_sig_keys:
+                    seen_sig_keys.add(key)
+                    sig_list.append(det)
+        # Also catch signals keyed on this endpoint directly (e.g. DNS-007
+        # keys on the apex domain, which is already in `indicators` for a
+        # matching DNS event, but guard for the endpoint-only case too).
+        for det in active_by_indicator.get(cand.endpoint, []):
+            key = (det.rule_id, det.indicator)
+            if key not in seen_sig_keys:
+                seen_sig_keys.add(key)
+                sig_list.append(det)
 
-    for ioc in iocs:
-        local_dets = detections_by_ioc.get(ioc.indicator, [])
-        feed_results = [r for r in ti_results.get(ioc.indicator, []) if r.available]
-        matches = [r for r in feed_results if r.matched]
+        ti_list: List[TIAssessment] = []
+        for ind in indicators:
+            for a in ti_assessments.get(ind, []):
+                if a.state != "UNKNOWN":
+                    ti_list.append(a)
 
-        if not local_dets and not matches:
-            continue  # nothing to correlate — not a finding on its own
+        ti_meaningful = any(a.is_meaningful for a in ti_list)
+        ti_malicious = any(a.state == MALICIOUS for a in ti_list)
+
+        if not sig_list and not ti_meaningful:
+            continue  # neither local detection nor meaningful TI -- inventory only
 
         counter += 1
-        score = 0
-        pcap_evidence = [f"{det.category}: {det.evidence}" for det in local_dets]
-        ti_evidence = [f"{r.feed} — {r.summary}" for r in matches]
+        first_seen, last_seen = _timestamps(cand)
 
-        if matches:
-            score += SCORE_WEIGHTS["ti_match"]
-            if len(matches) >= 2:
-                score += SCORE_WEIGHTS["ti_match_multi"]
-            if any(r.confidence == "High" for r in matches):
-                score += SCORE_WEIGHTS["high_confidence_ti"]
+        # --- Risk dimensions -------------------------------------------------
+        reputation = min(sum(a.weight for a in ti_list), risk_cfg["weights"]["reputation"])
+        behavior = min(sum(d.score for d in sig_list), risk_cfg["weights"]["behavior"])
 
-        for det in local_dets:
-            if det.category == "Suspicious User-Agent":
-                score += SCORE_WEIGHTS["suspicious_ua"]
-            elif det.category == "Suspicious HTTP Download":
-                score += SCORE_WEIGHTS["suspicious_download"]
-            elif "DNS" in det.category:
-                score += SCORE_WEIGHTS["suspicious_dns"]
-            elif det.category == "File Transfer Observed":
-                score += SCORE_WEIGHTS["file_signature"]
+        has_signature = any(f.signature for f in cand.file_events)
+        payload = 0
+        if cand.file_events:
+            if has_signature and (ti_malicious or any(d.rule_id == "FILE-001" for d in sig_list)):
+                payload = risk_cfg["weights"]["payload"]
+            elif has_signature:
+                payload = risk_cfg["weights"]["payload"] // 2
 
-        score = min(score, 100)
-        severity = risk_band(score)
+        stage_count = sum([bool(cand.dns_event), bool(cand.http_events), bool(cand.file_events)])
+        network_context = risk_cfg["weights"]["network_context"] if stage_count >= 3 else (
+            risk_cfg["weights"]["network_context"] // 2 if stage_count == 2 else 0)
 
-        classification = CONFIRMED_MALICIOUS if matches and any(
-            d.classification == HIGH_CONFIDENCE_SUSPICIOUS for d in local_dets
-        ) else None
-        category = classification or (local_dets[0].category if local_dets else "Threat Intelligence Match")
+        asset_context = 0  # no asset inventory available -- always reported as Unknown
 
-        if matches and local_dets:
-            summary = ("Multiple independent sources — local packet-level detection "
-                       "and one or more threat-intelligence feeds — support further "
-                       "investigation of this indicator.")
-        elif matches:
-            summary = ("Threat-intelligence feed(s) flagged this indicator; no local "
-                       "detection rule fired for it, so this stands on TI reputation alone.")
+        total = min(reputation + behavior + payload + network_context + asset_context, 100)
+        severity = band_from_score(total, bands)
+
+        # --- Severity caps: local-heuristics-only evidence is capped -------
+        if reputation == 0 and payload == 0:
+            severity = min_severity(severity, caps.get("behavior_only_max_severity", "Medium"))
+
+        # --- Confidence: independent of severity, driven by evidence diversity
+        diversity = sum([reputation > 0, behavior > 0, payload > 0])
+        if diversity >= 2 and (ti_malicious or payload > 0):
+            confidence = "High"
+        elif diversity >= 2:
+            confidence = "Medium"
+        elif sig_list and any(d.confidence == "High" for d in sig_list):
+            confidence = "Medium"
         else:
-            summary = ("Local detection logic flagged this indicator; no threat-"
-                       "intelligence feed had a record for it at the time of the scan.")
+            confidence = "Low"
+
+        dga_flagged = any(d.rule_id == "DNS-003" for d in sig_list)
+        title, category = _title_for(cand, ti_meaningful, ti_malicious, has_signature, dga_flagged)
+
+        domains = [cand.dns_event.domain] if cand.dns_event else []
+        source_ips = [cand.endpoint]
+        destination_ips = sorted({h.dest_ip for h in cand.http_events} |
+                                   (cand.dns_event.resolved_ips if cand.dns_event else set()))
+        hashes = sorted({f.sha256 for f in cand.file_events})
+        occurrence_count = ((cand.dns_event.occurrence_count if cand.dns_event else 0)
+                             + sum(h.occurrence_count for h in cand.http_events)
+                             + sum(f.transfer_count for f in cand.file_events))
+
+        evidence = [d.evidence[0] for d in sig_list if d.evidence]
+        ti_evidence = [a.summary for a in ti_list] or ["No meaningful threat-intelligence match."]
+
+        explanation_parts = []
+        if cand.dns_event:
+            explanation_parts.append(f"{cand.endpoint} queried {cand.dns_event.domain} "
+                                       f"{cand.dns_event.occurrence_count} time(s).")
+        if cand.http_events:
+            hosts = ", ".join(sorted({h.host for h in cand.http_events}))
+            explanation_parts.append(f"HTTP activity was observed to {hosts}.")
+        if cand.file_events:
+            explanation_parts.append(f"{len(cand.file_events)} distinct payload(s) were transferred, "
+                                       f"{sum(1 for f in cand.file_events if f.signature)} with a "
+                                       f"recognizable file signature.")
+        if sig_list:
+            explanation_parts.append(f"Local detection rule(s) {', '.join(sorted({d.rule_id for d in sig_list}))} "
+                                       f"fired for this activity.")
+        if ti_list:
+            explanation_parts.append(f"Threat-intelligence assessment: "
+                                       f"{', '.join(sorted({a.state for a in ti_list}))}.")
+        explanation_parts.append(f"Risk score {total}/100 (Reputation {reputation}, Behavior {behavior}, "
+                                   f"Payload {payload}, Network context {network_context}, "
+                                   f"Asset context {asset_context} — asset role unknown).")
+        explanation = " ".join(explanation_parts)
+
+        recommended_actions = _recommended_actions(cand, ti_malicious, has_signature)
 
         findings.append(Finding(
-            finding_id=f"THREAT-{counter:03d}",
-            ioc=ioc.indicator,
-            ioc_type=ioc.type,
-            severity=severity,
-            confidence="High" if matches and local_dets else "Medium" if (matches or local_dets) else "Low",
+            finding_id=f"F-{counter:03d}",
+            title=title,
             category=category,
-            risk_score=score,
-            pcap_evidence=pcap_evidence or ["Indicator observed in capture; see IOC inventory."],
-            ti_evidence=ti_evidence or ["No threat-intelligence match available."],
-            correlation_summary=summary,
-            recommended_action=(
-                "Investigate the originating endpoint and search historical network/"
-                "security logs for this indicator. Consider blocking confirmed "
-                "malicious infrastructure per local policy."
-            ),
+            severity=severity,
+            confidence=confidence,
+            risk_score=total,
+            affected_assets=[cand.endpoint],
+            source_ips=source_ips,
+            destination_ips=destination_ips,
+            domains=domains,
+            hashes=hashes,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            occurrence_count=occurrence_count,
+            detection_signals=sig_list,
+            evidence=evidence,
+            threat_intelligence=ti_evidence,
+            explanation=explanation,
+            recommended_actions=recommended_actions,
+            event_chain=_event_chain(cand),
         ))
 
+    findings_before_dedup = len(findings)
+    findings = _deduplicate(findings, config)
     findings.sort(key=lambda f: f.risk_score, reverse=True)
-    return findings
+    # Renumber after sort/dedup so IDs stay dense and severity-ordered.
+    for idx, f in enumerate(findings, start=1):
+        f.finding_id = f"F-{idx:03d}"
+
+    stats = {
+        "candidates_evaluated": len(candidates),
+        "findings_before_dedup": findings_before_dedup,
+        "findings_after_dedup": len(findings),
+    }
+    return findings, stats
+
+
+def _recommended_actions(cand: _Candidate, ti_malicious: bool, has_signature: bool) -> List[str]:
+    actions = [f"Investigate endpoint {cand.endpoint} for signs of compromise."]
+    if cand.dns_event:
+        actions.append(f"Review historical DNS logs for {cand.dns_event.domain} across the environment.")
+    if cand.file_events:
+        for f in cand.file_events:
+            actions.append(f"Search EDR/AV for SHA256 {f.sha256}.")
+        actions.append("Analyze the recovered payload in an isolated sandbox before further action.")
+    if cand.http_events:
+        hosts = sorted({h.host for h in cand.http_events})
+        actions.append(f"Search proxy/web logs for prior connections to {', '.join(hosts)}.")
+    if ti_malicious:
+        actions.append("Block the associated infrastructure at the network boundary per policy.")
+    return actions
+
+
+def _fingerprint(f: Finding) -> Tuple:
+    return (
+        tuple(sorted(f.source_ips)),
+        tuple(sorted(f.domains)),
+        tuple(sorted(f.hashes)),
+        tuple(sorted(f.destination_ips)),
+    )
+
+
+def _deduplicate(findings: List[Finding], config: dict) -> List[Finding]:
+    """Merge findings that describe the same endpoint + indicator set
+    (e.g. produced from overlapping candidates) rather than reporting
+    them as separate incidents. Occurrence counts, evidence and
+    first/last-seen are combined; nothing is discarded."""
+    merged: Dict[Tuple, Finding] = {}
+    for f in findings:
+        key = _fingerprint(f)
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = f
+            continue
+        existing.occurrence_count += f.occurrence_count
+        existing.evidence = list(dict.fromkeys(existing.evidence + f.evidence))
+        existing.threat_intelligence = list(dict.fromkeys(existing.threat_intelligence + f.threat_intelligence))
+        existing.detection_signals = existing.detection_signals + [
+            d for d in f.detection_signals if d not in existing.detection_signals]
+        existing.recommended_actions = list(dict.fromkeys(existing.recommended_actions + f.recommended_actions))
+        if f.first_seen and (not existing.first_seen or f.first_seen < existing.first_seen):
+            existing.first_seen = f.first_seen
+        if f.last_seen and (not existing.last_seen or f.last_seen > existing.last_seen):
+            existing.last_seen = f.last_seen
+        if f.risk_score > existing.risk_score:
+            existing.risk_score = f.risk_score
+            existing.severity = f.severity
+            existing.confidence = f.confidence
+    return list(merged.values())
+
+
+def build_timeline(aggregation: AggregationResult, findings: List[Finding]) -> List[TimelineEvent]:
+    """Behavioral timeline: one entry per behavioral event (not per
+    packet), referencing the finding it contributed to when there is one."""
+    finding_by_indicator: Dict[str, str] = {}
+    for f in findings:
+        for ind in (f.domains + f.destination_ips + f.hashes + f.source_ips):
+            finding_by_indicator.setdefault(ind, f.finding_id)
+
+    events: List[TimelineEvent] = []
+    for ev in aggregation.dns_events:
+        events.append(TimelineEvent(
+            ev.first_seen,
+            f"{ev.source_ip} queried {ev.domain} ({ev.occurrence_count} time(s), "
+            f"{ev.first_seen.strftime('%H:%M:%S')}–{ev.last_seen.strftime('%H:%M:%S')})",
+            finding_id=finding_by_indicator.get(ev.domain),
+        ))
+    for ev in aggregation.http_events:
+        paths = ", ".join(ev.paths[:3]) + ("..." if len(ev.paths) > 3 else "") if ev.paths else "/"
+        events.append(TimelineEvent(
+            ev.first_seen,
+            f"{ev.source_ip} \u2192 {ev.dest_ip} HTTP activity to {ev.host} "
+            f"({ev.occurrence_count} request(s): {paths})",
+            finding_id=finding_by_indicator.get(ev.dest_ip) or finding_by_indicator.get(ev.host),
+        ))
+    for ev in aggregation.file_events:
+        events.append(TimelineEvent(
+            ev.first_seen,
+            f"Payload transferred {ev.src_ip} \u2192 {ev.dst_ip} "
+            f"({ev.signature or 'unrecognized'}, SHA256 {ev.sha256[:16]}...)",
+            finding_id=finding_by_indicator.get(ev.sha256),
+        ))
+    events.sort(key=lambda e: e.timestamp)
+    return events
