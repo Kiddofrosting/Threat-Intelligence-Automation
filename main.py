@@ -22,11 +22,14 @@ from dotenv import load_dotenv
 
 from analyzer.aggregator import aggregate
 from analyzer.allowlist import load_allowlist
+from analyzer.assets import load_assets
 from analyzer.config import load_config
-from analyzer.correlator import build_timeline, correlate, interpret_ti_results
+from analyzer.correlator import build_incidents, build_timeline, correlate, interpret_ti_results
 from analyzer.detector import run_detections
+from analyzer.domain_history import load_history, save_history
 from analyzer.ioc_extractor import extract_iocs
 from analyzer.ioc_scoring import classify_iocs
+from analyzer.json_export import build_json_report, write_json_report
 from analyzer.pcap_parser import parse_pcap
 from analyzer.reporter import generate_markdown_report
 from feeds.abuseipdb import AbuseIPDBClient
@@ -56,6 +59,19 @@ def parse_args():
                          help="Path to the detection/risk-scoring configuration file.")
     parser.add_argument("--allowlist", default="config/allowlist.yaml",
                          help="Path to the allowlist/suppression configuration file.")
+    parser.add_argument("--assets", default="config/assets.yaml",
+                         help="Path to the asset inventory configuration file.")
+    parser.add_argument("--domain-history", default="cache/domain_history.json",
+                         help="Path to the local domain-history baseline used by DNS-005.")
+    parser.add_argument("--no-domain-history", action="store_true",
+                         help="Disable the newly-observed-domain rule and its history file entirely.")
+    parser.add_argument("--json-output", default=None,
+                         help="Also write a machine-readable JSON report (findings, detections, "
+                              "IOC profiles, TI assessments, timeline) to this path, for SIEM/"
+                              "automation ingestion.")
+    parser.add_argument("--fail-on-high", action="store_true",
+                         help="Exit with status 2 if any finding reaches High or Critical severity "
+                              "(useful for CI/automation pipelines that should react to that).")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     return parser.parse_args()
 
@@ -91,6 +107,7 @@ def main():
 
     config = load_config(args.config)
     allowlist = load_allowlist(args.allowlist)
+    assets = load_assets(args.assets)
 
     logger.info("[+] Loading PCAP")
     capture = parse_pcap(args.pcap, logger=logger)
@@ -109,7 +126,10 @@ def main():
                 f"{aggregation.raw_file_observations} raw observations)")
 
     logger.info("[+] Running detections")
-    detections = run_detections(aggregation, config=config, allowlist=allowlist)
+    known_domains = None
+    if not args.no_domain_history:
+        known_domains = load_history(args.domain_history)
+    detections = run_detections(aggregation, config=config, allowlist=allowlist, known_domains=known_domains)
     active = [d for d in detections if not d.suppressed]
     logger.info(f"    {len(detections)} detection signal(s) generated "
                 f"({len(active)} active, {len(detections) - len(active)} suppressed)")
@@ -156,9 +176,11 @@ def main():
     ioc_profiles = classify_iocs(iocs, detections, ti_assessments, observation_counts)
 
     logger.info("[+] Correlating findings")
-    findings, correlation_stats = correlate(capture, iocs, aggregation, detections, ti_results, config=config)
+    findings, correlation_stats = correlate(capture, iocs, aggregation, detections, ti_results,
+                                             config=config, assets=assets)
     timeline = build_timeline(aggregation, findings)
-    logger.info(f"    {len(findings)} correlated finding(s) "
+    incidents = build_incidents(findings)
+    logger.info(f"    {len(findings)} correlated finding(s) grouped into {len(incidents)} incident(s) "
                 f"({correlation_stats['candidates_evaluated']} candidate(s) evaluated, "
                 f"{correlation_stats['findings_before_dedup']} before dedup)")
 
@@ -175,12 +197,32 @@ def main():
         ti_assessments=ti_assessments,
         ioc_profiles=ioc_profiles,
         findings=findings,
+        incidents=incidents,
         timeline=timeline,
         unavailable_feeds=unavailable_feeds,
         correlation_stats=correlation_stats,
     )
 
+    if args.json_output:
+        logger.info("[+] Writing JSON report")
+        json_data = build_json_report(
+            pcap_path=args.pcap, capture=capture, iocs=iocs, detections=detections,
+            ti_assessments=ti_assessments, ioc_profiles=ioc_profiles, findings=findings,
+            timeline=timeline, unavailable_feeds=unavailable_feeds, correlation_stats=correlation_stats,
+            incidents=incidents,
+        )
+        os.makedirs(os.path.dirname(args.json_output) or ".", exist_ok=True)
+        write_json_report(args.json_output, json_data)
+
     logger.info(f"[+] Analysis complete — report written to {args.output}")
+
+    if not args.no_domain_history:
+        updated_history = (known_domains or set()) | {ev.domain for ev in aggregation.dns_events}
+        save_history(updated_history, args.domain_history)
+
+    if args.fail_on_high and any(f.severity in ("High", "Critical") for f in findings):
+        logger.warning("[!] Exiting with status 2: a High or Critical severity finding was produced.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

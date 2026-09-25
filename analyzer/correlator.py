@@ -22,9 +22,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
 from analyzer.aggregator import AggregationResult, DNSBehavior, FileBehavior, HTTPBehavior
+from analyzer.assets import AssetProfile, get_asset, highest_criticality
 from analyzer.config import DEFAULT_CONFIG, band_from_score, min_severity
-from analyzer.detector import DetectionSignal
+from analyzer.detector import INFORMATIONAL, DetectionSignal
 from analyzer.ioc_extractor import IOC
+from analyzer.kill_chain import stages_for
 from analyzer.pcap_parser import ParsedCapture
 from analyzer.ti_interpreter import MALICIOUS, SUSPICIOUS, TIAssessment, interpret
 from feeds.base import FeedResult
@@ -59,6 +61,11 @@ class Finding:
     explanation: str = ""
     recommended_actions: List[str] = field(default_factory=list)
     event_chain: Optional[str] = None
+    asset_notes: List[str] = field(default_factory=list)
+    mitre_techniques: List[str] = field(default_factory=list)
+    kill_chain_stages: List[str] = field(default_factory=list)
+    evidence_basis: Dict[str, List[str]] = field(default_factory=dict)
+    analyst_questions: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -96,6 +103,13 @@ def _build_candidates(aggregation: AggregationResult) -> List[_Candidate]:
             endpoints.add(f.dst_ip)
         else:
             endpoints.add(f.src_ip)
+
+    # Sources whose only visible activity is TCP-level connection
+    # fan-out (scanning/recon/exfiltration) still need a candidate so
+    # their NET-00x signals get a chance to become a finding, even
+    # though there is no DNS/HTTP/file stage to attach them to.
+    scan_only_endpoints = set(aggregation.scan_candidates.keys()) - endpoints
+    endpoints.update(scan_only_endpoints)
 
     candidates: List[_Candidate] = []
     used_http: Set[int] = set()
@@ -141,6 +155,11 @@ def _build_candidates(aggregation: AggregationResult) -> List[_Candidate]:
             used_file.add(id(f))
             candidates.append(_Candidate(endpoint=endpoint, file_events=[f]))
 
+        if endpoint in scan_only_endpoints:
+            # Bare candidate: no DNS/HTTP/file stage, purely so NET-00x
+            # signals keyed on this endpoint can be picked up below.
+            candidates.append(_Candidate(endpoint=endpoint))
+
     return candidates
 
 
@@ -172,8 +191,11 @@ def _timestamps(cand: _Candidate) -> Tuple[Optional[datetime], Optional[datetime
     return min(times), max(times)
 
 
-def _event_chain(cand: _Candidate) -> Optional[str]:
+def _event_chain(cand: _Candidate, sig_list: List[DetectionSignal]) -> Optional[str]:
     stages = []
+    net_signals = [d for d in sig_list if d.category == "Network" and d.rule_id in ("NET-001", "NET-002")]
+    if net_signals:
+        stages.append(f"Network reconnaissance ({', '.join(sorted({d.rule_id for d in net_signals}))})")
     if cand.dns_event:
         stages.append(f"DNS ({cand.dns_event.domain})")
     if cand.http_events:
@@ -182,15 +204,29 @@ def _event_chain(cand: _Candidate) -> Optional[str]:
     if cand.file_events:
         sigs = ", ".join(sorted({f.signature or "unrecognized payload" for f in cand.file_events}))
         stages.append(f"File transfer ({sigs})")
+    exfil_signals = [d for d in sig_list if d.rule_id == "NET-004"]
+    if exfil_signals:
+        stages.append("Outbound data transfer (possible exfiltration)")
     if len(stages) < 2:
         return None
     return "\n  \u2193\n".join(stages)
 
 
-def _title_for(cand: _Candidate, ti_meaningful: bool, ti_malicious: bool,
+def _title_for(cand: _Candidate, sig_list: List[DetectionSignal], ti_meaningful: bool, ti_malicious: bool,
                 has_signature: bool, dga_flagged: bool) -> Tuple[str, str]:
+    rule_ids = {d.rule_id for d in sig_list}
     if cand.file_events and (ti_malicious or has_signature):
         return "Suspicious Payload Retrieval", "Payload Delivery"
+    if "NET-004" in rule_ids:
+        return f"Possible Data Exfiltration from {cand.endpoint}", "Data Exfiltration"
+    if "NET-003" in rule_ids:
+        return f"Repeated Authentication-Service Connection Attempts from {cand.endpoint}", "Credential Access"
+    if "BEACON-001" in rule_ids:
+        host = sorted({h.host for h in cand.http_events})[0] if cand.http_events else cand.endpoint
+        return f"Possible Beaconing to {host}", "Command and Control"
+    if "NET-001" in rule_ids or "NET-002" in rule_ids:
+        label = "Port Scanning" if "NET-001" in rule_ids else "Host Scanning"
+        return f"{label} from {cand.endpoint}", "Reconnaissance"
     if cand.dns_event and dga_flagged:
         return f"Potential DGA Domain Activity — {cand.dns_event.domain}", "DNS Behavior"
     if cand.http_events and ti_meaningful:
@@ -201,6 +237,96 @@ def _title_for(cand: _Candidate, ti_meaningful: bool, ti_malicious: bool,
     return "Suspicious Network Activity", "Behavioral"
 
 
+def _evidence_basis(cand: _Candidate, sig_list: List[DetectionSignal], ti_list: List[TIAssessment],
+                     ti_malicious: bool, has_signature: bool) -> Dict[str, List[str]]:
+    """Splits what's known about this finding into four epistemic
+    tiers, per the brief's explicit requirement to distinguish these:
+    established (directly observed), strongly indicated (multiple
+    independent signals agree), possible (a plausible but unconfirmed
+    interpretation), and not established (explicitly not provable from
+    this capture)."""
+    established: List[str] = []
+    strongly_indicated: List[str] = []
+    possible: List[str] = []
+    not_established: List[str] = []
+
+    if cand.dns_event:
+        established.append(f"{cand.endpoint} issued {cand.dns_event.occurrence_count} DNS "
+                            f"quer(y/ies) for {cand.dns_event.domain}, directly observed in the capture.")
+    for h in cand.http_events:
+        established.append(f"{cand.endpoint} sent {h.occurrence_count} HTTP request(s) to {h.host} "
+                            f"({h.dest_ip}), directly observed in the capture.")
+    for f in cand.file_events:
+        established.append(f"A {f.size}-byte payload was transferred between {f.src_ip} and "
+                            f"{f.dst_ip}" + (f", identified as {f.signature} by magic bytes" if f.signature else "") + ".")
+
+    rule_ids = {d.rule_id for d in sig_list}
+    if "DNS-003" in rule_ids:
+        strongly_indicated.append("Multi-signal heuristic scoring (entropy, digit/vowel ratio, "
+                                   "dictionary-word absence) is consistent with algorithmic domain generation.")
+    if ("NET-001" in rule_ids or "NET-002" in rule_ids) and len(rule_ids) >= 1:
+        strongly_indicated.append(f"{cand.endpoint} shows a connection fan-out and success-ratio pattern "
+                                   f"consistent with network reconnaissance/scanning.")
+    if "BEACON-001" in rule_ids:
+        strongly_indicated.append("Connection timing shows low-variance, regular intervals, a "
+                                   "conventional beaconing indicator.")
+    if ti_malicious and sig_list:
+        strongly_indicated.append("Independent local-detection and threat-intelligence evidence "
+                                   "point to the same conclusion.")
+    elif ti_malicious:
+        strongly_indicated.append("Threat intelligence reports this indicator as malicious.")
+
+    if cand.file_events and has_signature:
+        possible.append("The transferred executable/script may have been executed on the endpoint.")
+        not_established.append("Whether the transferred payload was actually executed is not "
+                                "established from network evidence alone.")
+    if "NET-003" in rule_ids:
+        possible.append("The repeated connection attempts may represent credential-guessing activity.")
+        not_established.append("Whether any authentication was attempted, and its outcome, is not "
+                                "established -- this parser does not decode the authentication protocol.")
+    if "HTTP-008" in rule_ids:
+        possible.append("The repeated suspicious request pattern may represent an exploitation attempt.")
+        not_established.append("Whether any exploitation attempt succeeded is not established from "
+                                "the request pattern alone; server-side response/behavior evidence "
+                                "would be needed to confirm.")
+    if "NET-004" in rule_ids:
+        possible.append("The asymmetric outbound volume may represent data exfiltration.")
+        not_established.append("What data, if any, was actually transferred is not established from "
+                                "byte-volume evidence alone.")
+    if cand.dns_event and "DNS-003" in rule_ids and not ti_list:
+        not_established.append("No independent threat-intelligence evidence corroborates this domain; "
+                                "the DGA classification rests on lexical/behavioral heuristics alone.")
+
+    return {
+        "established": established,
+        "strongly_indicated": strongly_indicated,
+        "possible": possible,
+        "not_established": not_established,
+    }
+
+
+def _analyst_questions(cand: _Candidate, sig_list: List[DetectionSignal], ti_malicious: bool,
+                        has_signature: bool) -> List[str]:
+    rule_ids = {d.rule_id for d in sig_list}
+    questions: List[str] = []
+    if cand.file_events and has_signature:
+        questions.append("Was the downloaded payload executed on the endpoint (EDR/AV logs)?")
+    if ti_malicious or cand.dns_event or cand.http_events:
+        questions.append(f"Did {cand.endpoint} communicate with this infrastructure prior to this capture?")
+    if "NET-001" in rule_ids or "NET-002" in rule_ids:
+        questions.append("Did the scanning activity yield any successful service access?")
+    if "NET-003" in rule_ids:
+        questions.append("Were valid credentials for the targeted service ever entered successfully?")
+    if "BEACON-001" in rule_ids:
+        questions.append("Is there evidence of data staged for transfer following these periodic connections?")
+    if "NET-004" in rule_ids:
+        questions.append("What data, specifically, was included in the outbound transfer?")
+    if "DNS-006" in rule_ids:
+        questions.append("What information is being encoded in these DNS queries?")
+    questions.append(f"Has {cand.endpoint} shown similar behavior at other times, or authenticated to other systems?")
+    return questions
+
+
 def correlate(
     capture: ParsedCapture,
     iocs: List[IOC],
@@ -208,25 +334,43 @@ def correlate(
     detections: List[DetectionSignal],
     ti_results: Dict[str, List[FeedResult]],
     config: Optional[dict] = None,
+    assets: Optional[Dict[str, AssetProfile]] = None,
 ) -> Tuple[List[Finding], dict]:
     """Returns (findings, stats). `stats` carries observability counters
     (candidates evaluated, findings before/after deduplication) used by
-    the detection-tuning report; see analyzer/reporter.py."""
+    the detection-tuning report; see analyzer/reporter.py.
+
+    `assets` is an optional IP -> AssetProfile map (see
+    analyzer/assets.py, config/assets.yaml). When an endpoint or
+    destination IP involved in a finding has a known asset entry, its
+    criticality raises the Asset Context risk dimension and is
+    reported by name; unmapped IPs are always reported as Unknown."""
     config = config or DEFAULT_CONFIG
+    assets = assets or {}
     risk_cfg = config["risk"]
     bands = risk_cfg["severity_bands"]
     caps = risk_cfg["caps"]
+    asset_weights = risk_cfg.get("asset_criticality_weights", DEFAULT_CONFIG["risk"]["asset_criticality_weights"])
 
     ti_assessments = interpret_ti_results(ti_results, config)
 
     active_by_indicator: Dict[str, List[DetectionSignal]] = defaultdict(list)
+    signals_by_source_ip: Dict[str, List[DetectionSignal]] = defaultdict(list)
     for det in detections:
         if not det.suppressed:
             active_by_indicator[det.indicator].append(det)
+            # Network/Behavioral signals (scanning, exfiltration, beaconing)
+            # are inherently about the SOURCE endpoint, not the destination
+            # indicator they happen to be keyed on -- tracked separately so
+            # exactly one candidate per endpoint absorbs them (see below),
+            # rather than every candidate for that endpoint duplicating them.
+            if det.category in ("Network", "Behavioral") and det.source_ip:
+                signals_by_source_ip[det.source_ip].append(det)
 
     candidates = _build_candidates(aggregation)
     findings: List[Finding] = []
     counter = 0
+    claimed_network_endpoints: Set[str] = set()
 
     for cand in candidates:
         indicators = _candidate_indicators(cand)
@@ -246,6 +390,16 @@ def correlate(
             if key not in seen_sig_keys:
                 seen_sig_keys.add(key)
                 sig_list.append(det)
+        # First candidate encountered for this endpoint absorbs its
+        # Network/Behavioral signals (scanning, exfil, beaconing) --
+        # ensures they appear in exactly one finding for that endpoint.
+        if cand.endpoint not in claimed_network_endpoints:
+            claimed_network_endpoints.add(cand.endpoint)
+            for det in signals_by_source_ip.get(cand.endpoint, []):
+                key = (det.rule_id, det.indicator)
+                if key not in seen_sig_keys:
+                    seen_sig_keys.add(key)
+                    sig_list.append(det)
 
         ti_list: List[TIAssessment] = []
         for ind in indicators:
@@ -256,15 +410,32 @@ def correlate(
         ti_meaningful = any(a.is_meaningful for a in ti_list)
         ti_malicious = any(a.state == MALICIOUS for a in ti_list)
 
-        if not sig_list and not ti_meaningful:
-            continue  # neither local detection nor meaningful TI -- inventory only
+        # Rarity/novelty-only signals (DNS-004, DNS-005, HTTP-004) are
+        # Informational by design -- weak enough that, alone, they should
+        # not promote a finding any more than a WEAK_REPUTATION TI result
+        # does. They still contribute to the Behavior score below when
+        # something more substantial fires alongside them.
+        substantive_signals = [d for d in sig_list if d.severity != INFORMATIONAL]
+        if not substantive_signals and not ti_meaningful:
+            continue  # neither substantive local detection nor meaningful TI -- inventory only
 
         counter += 1
         first_seen, last_seen = _timestamps(cand)
 
         # --- Risk dimensions -------------------------------------------------
         reputation = min(sum(a.weight for a in ti_list), risk_cfg["weights"]["reputation"])
-        behavior = min(sum(d.score for d in sig_list), risk_cfg["weights"]["behavior"])
+
+        # Behavior dimension: cap each evidence FAMILY (category) before
+        # summing, so several signals restating the same underlying
+        # behavior (e.g. three DNS rules firing for one beaconing domain)
+        # don't each contribute full independent weight -- see
+        # config/detection_config.yaml -> risk.category_caps.
+        category_caps = risk_cfg.get("category_caps", {})
+        category_sums: Dict[str, int] = {}
+        for d in sig_list:
+            category_sums[d.category] = category_sums.get(d.category, 0) + d.score
+        behavior_raw = sum(min(v, category_caps.get(cat, v)) for cat, v in category_sums.items())
+        behavior = min(behavior_raw, risk_cfg["weights"]["behavior"])
 
         has_signature = any(f.signature for f in cand.file_events)
         payload = 0
@@ -278,7 +449,17 @@ def correlate(
         network_context = risk_cfg["weights"]["network_context"] if stage_count >= 3 else (
             risk_cfg["weights"]["network_context"] // 2 if stage_count == 2 else 0)
 
-        asset_context = 0  # no asset inventory available -- always reported as Unknown
+        # --- Asset context: real lookup against config/assets.yaml ---------
+        involved_ips = {cand.endpoint}
+        involved_ips.update(h.dest_ip for h in cand.http_events)
+        if cand.dns_event:
+            involved_ips.update(cand.dns_event.resolved_ips)
+        involved_ips.update(f.src_ip for f in cand.file_events)
+        involved_ips.update(f.dst_ip for f in cand.file_events)
+        best_asset = highest_criticality(involved_ips, assets)
+        asset_context = min(asset_weights.get(best_asset.criticality, 0), risk_cfg["weights"]["asset_context"])
+        asset_notes = [get_asset(ip, assets).describe() for ip in sorted(involved_ips)
+                       if get_asset(ip, assets).is_known]
 
         total = min(reputation + behavior + payload + network_context + asset_context, 100)
         severity = band_from_score(total, bands)
@@ -299,7 +480,7 @@ def correlate(
             confidence = "Low"
 
         dga_flagged = any(d.rule_id == "DNS-003" for d in sig_list)
-        title, category = _title_for(cand, ti_meaningful, ti_malicious, has_signature, dga_flagged)
+        title, category = _title_for(cand, sig_list, ti_meaningful, ti_malicious, has_signature, dga_flagged)
 
         domains = [cand.dns_event.domain] if cand.dns_event else []
         source_ips = [cand.endpoint]
@@ -332,10 +513,18 @@ def correlate(
                                        f"{', '.join(sorted({a.state for a in ti_list}))}.")
         explanation_parts.append(f"Risk score {total}/100 (Reputation {reputation}, Behavior {behavior}, "
                                    f"Payload {payload}, Network context {network_context}, "
-                                   f"Asset context {asset_context} — asset role unknown).")
+                                   f"Asset context {asset_context}"
+                                   + (f", highest-criticality asset: {best_asset.criticality}"
+                                      if best_asset.is_known else " — asset role unknown")
+                                   + ").")
         explanation = " ".join(explanation_parts)
 
-        recommended_actions = _recommended_actions(cand, ti_malicious, has_signature)
+        recommended_actions = _recommended_actions(cand, ti_malicious, has_signature, best_asset)
+        mitre_techniques = sorted({f"{d.mitre_technique_id} — {d.mitre_technique_name}"
+                                     for d in sig_list if d.mitre_technique_id})
+        kill_chain_stages = stages_for([d.rule_id for d in sig_list])
+        evidence_basis = _evidence_basis(cand, sig_list, ti_list, ti_malicious, has_signature)
+        analyst_questions = _analyst_questions(cand, sig_list, ti_malicious, has_signature)
 
         findings.append(Finding(
             finding_id=f"F-{counter:03d}",
@@ -357,7 +546,12 @@ def correlate(
             threat_intelligence=ti_evidence,
             explanation=explanation,
             recommended_actions=recommended_actions,
-            event_chain=_event_chain(cand),
+            event_chain=_event_chain(cand, sig_list),
+            asset_notes=asset_notes,
+            mitre_techniques=mitre_techniques,
+            kill_chain_stages=kill_chain_stages,
+            evidence_basis=evidence_basis,
+            analyst_questions=analyst_questions,
         ))
 
     findings_before_dedup = len(findings)
@@ -375,8 +569,12 @@ def correlate(
     return findings, stats
 
 
-def _recommended_actions(cand: _Candidate, ti_malicious: bool, has_signature: bool) -> List[str]:
+def _recommended_actions(cand: _Candidate, ti_malicious: bool, has_signature: bool,
+                          best_asset: AssetProfile) -> List[str]:
     actions = [f"Investigate endpoint {cand.endpoint} for signs of compromise."]
+    if best_asset.is_known and best_asset.criticality in ("High", "Critical"):
+        actions.insert(0, f"Escalate immediately: this finding involves {best_asset.describe()}, "
+                          f"a {best_asset.criticality}-criticality asset.")
     if cand.dns_event:
         actions.append(f"Review historical DNS logs for {cand.dns_event.domain} across the environment.")
     if cand.file_events:
@@ -418,6 +616,13 @@ def _deduplicate(findings: List[Finding], config: dict) -> List[Finding]:
         existing.detection_signals = existing.detection_signals + [
             d for d in f.detection_signals if d not in existing.detection_signals]
         existing.recommended_actions = list(dict.fromkeys(existing.recommended_actions + f.recommended_actions))
+        existing.asset_notes = list(dict.fromkeys(existing.asset_notes + f.asset_notes))
+        existing.mitre_techniques = list(dict.fromkeys(existing.mitre_techniques + f.mitre_techniques))
+        existing.kill_chain_stages = list(dict.fromkeys(existing.kill_chain_stages + f.kill_chain_stages))
+        existing.analyst_questions = list(dict.fromkeys(existing.analyst_questions + f.analyst_questions))
+        for tier in ("established", "strongly_indicated", "possible", "not_established"):
+            existing.evidence_basis[tier] = list(dict.fromkeys(
+                existing.evidence_basis.get(tier, []) + f.evidence_basis.get(tier, [])))
         if f.first_seen and (not existing.first_seen or f.first_seen < existing.first_seen):
             existing.first_seen = f.first_seen
         if f.last_seen and (not existing.last_seen or f.last_seen > existing.last_seen):
@@ -427,6 +632,83 @@ def _deduplicate(findings: List[Finding], config: dict) -> List[Finding]:
             existing.severity = f.severity
             existing.confidence = f.confidence
     return list(merged.values())
+
+
+@dataclass
+class Incident:
+    """A higher-level grouping of Findings that share the same
+    endpoint -- this is what turns "Finding 1, Finding 2, Finding 3"
+    belonging to one host's activity into one coherent incident
+    narrative, per the brief's incident-reconstruction requirement."""
+    incident_id: str
+    title: str
+    severity: str
+    confidence: str
+    risk_score: int
+    findings: List[Finding]
+    affected_assets: List[str]
+    first_seen: Optional[datetime]
+    last_seen: Optional[datetime]
+    narrative: str
+    kill_chain_stages: List[str]
+    mitre_techniques: List[str]
+
+
+def build_incidents(findings: List[Finding]) -> List[Incident]:
+    """Group findings by their (single) affected endpoint. An endpoint
+    with only one finding still gets an Incident wrapper (so the report
+    has one consistent structure to render), but the narrative and
+    kill-chain view are most valuable when 2+ findings for the same
+    endpoint combine into a single story."""
+    by_endpoint: Dict[str, List[Finding]] = defaultdict(list)
+    for f in findings:
+        endpoint = f.affected_assets[0] if f.affected_assets else "unknown"
+        by_endpoint[endpoint].append(f)
+
+    severity_rank_order = ["Informational", "Low", "Medium", "High", "Critical"]
+    incidents: List[Incident] = []
+    for idx, (endpoint, group) in enumerate(sorted(by_endpoint.items(), key=lambda kv: -max(f.risk_score for f in kv[1])), start=1):
+        group = sorted(group, key=lambda f: (f.first_seen or datetime.min))
+        severity = max(group, key=lambda f: severity_rank_order.index(f.severity)).severity
+        confidence = max((f.confidence for f in group),
+                          key=lambda c: {"Low": 0, "Medium": 1, "High": 2}.get(c, 0))
+        risk_score = max(f.risk_score for f in group)
+        first_seen = min((f.first_seen for f in group if f.first_seen), default=None)
+        last_seen = max((f.last_seen for f in group if f.last_seen), default=None)
+        stages: List[str] = []
+        for f in group:
+            for s in f.kill_chain_stages:
+                if s not in stages:
+                    stages.append(s)
+        techniques = sorted({t for f in group for t in f.mitre_techniques})
+
+        if len(group) > 1:
+            titles = [f.title for f in group]
+            title = f"Multi-stage activity involving {endpoint}"
+            narrative_steps = [f"{f.first_seen.strftime('%H:%M:%S') if f.first_seen else '??:??:??'} — "
+                                f"{f.title} (severity {f.severity}, {f.finding_id})" for f in group]
+            narrative = (f"{endpoint} is associated with {len(group)} correlated findings in this "
+                         f"capture: {', '.join(titles)}. Chronologically: " + "; ".join(narrative_steps) + ".")
+        else:
+            title = group[0].title
+            narrative = group[0].explanation
+
+        incidents.append(Incident(
+            incident_id=f"INC-{idx:03d}",
+            title=title,
+            severity=severity,
+            confidence=confidence,
+            risk_score=risk_score,
+            findings=group,
+            affected_assets=[endpoint],
+            first_seen=first_seen,
+            last_seen=last_seen,
+            narrative=narrative,
+            kill_chain_stages=stages,
+            mitre_techniques=techniques,
+        ))
+
+    return incidents
 
 
 def build_timeline(aggregation: AggregationResult, findings: List[Finding]) -> List[TimelineEvent]:
@@ -459,6 +741,16 @@ def build_timeline(aggregation: AggregationResult, findings: List[Finding]) -> L
             f"Payload transferred {ev.src_ip} \u2192 {ev.dst_ip} "
             f"({ev.signature or 'unrecognized'}, SHA256 {ev.sha256[:16]}...)",
             finding_id=finding_by_indicator.get(ev.sha256),
+        ))
+    for src_ip, cand in aggregation.scan_candidates.items():
+        if cand.first_seen is None:
+            continue
+        events.append(TimelineEvent(
+            cand.first_seen,
+            f"{src_ip} attempted connections to {len(cand.distinct_dst_ips)} distinct IP(s) / "
+            f"{len(cand.distinct_dst_ports)} distinct port(s), {cand.success_ratio:.0%} success ratio "
+            f"({cand.total_syn} attempt(s))",
+            finding_id=finding_by_indicator.get(src_ip),
         ))
     events.sort(key=lambda e: e.timestamp)
     return events

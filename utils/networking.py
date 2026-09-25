@@ -41,10 +41,6 @@ SUSPICIOUS_EXTENSIONS = [
     ".hta", ".cpl", ".msi",
 ]
 
-SUSPICIOUS_TLDS = [
-    ".top", ".xyz", ".click", ".gq", ".tk", ".ml", ".cf", ".ga", ".icu",
-]
-
 
 def has_suspicious_user_agent(user_agent: str) -> bool:
     if not user_agent:
@@ -58,23 +54,3 @@ def has_suspicious_extension(path: str) -> bool:
         return False
     lowered = path.lower().split("?")[0]
     return any(lowered.endswith(ext) for ext in SUSPICIOUS_EXTENSIONS)
-
-
-def has_suspicious_tld(domain: str) -> bool:
-    if not domain:
-        return False
-    lowered = domain.lower()
-    return any(lowered.endswith(tld) for tld in SUSPICIOUS_TLDS)
-
-
-def looks_dga_like(domain: str) -> bool:
-    """Very rough heuristic: long, high-entropy-looking subdomain labels
-    with few vowels are the kind of thing a domain-generation algorithm
-    produces. This is a hint for an analyst, not a verdict."""
-    if not domain:
-        return False
-    label = domain.split(".")[0]
-    if len(label) < 12:
-        return False
-    vowels = sum(1 for c in label.lower() if c in "aeiou")
-    return vowels / max(len(label), 1) < 0.25

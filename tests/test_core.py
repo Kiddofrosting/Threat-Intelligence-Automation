@@ -15,17 +15,20 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analyzer.aggregator import aggregate, aggregate_dns, aggregate_files, aggregate_http
+from analyzer.aggregator import aggregate, aggregate_connections, aggregate_dns, aggregate_files, aggregate_http
 from analyzer.allowlist import check_domain, load_allowlist
+from analyzer.beaconing import compute_interval_stats
 from analyzer.config import DEFAULT_CONFIG, band_from_score, min_severity
-from analyzer.correlator import build_timeline, correlate
+from analyzer.correlator import build_incidents, build_timeline, correlate
 from analyzer.detector import run_detections
 from analyzer.dga import score_domain
 from analyzer.ioc_extractor import IOC, extract_iocs
 from analyzer.ioc_scoring import classify_iocs
+from analyzer.mitre_mapping import get_technique
 from analyzer.pcap_parser import DNSRecord, ExtractedFile, HTTPRecord, PacketRecord, ParsedCapture
 from analyzer.reporter import generate_markdown_report
 from analyzer.ti_interpreter import CLEAN, MALICIOUS, SUSPICIOUS, UNKNOWN, WEAK_REPUTATION, interpret
+from analyzer.web_attack_patterns import match_path
 from feeds.base import FeedResult
 from utils.hashing import hashes_for, identify_signature
 from utils.networking import has_suspicious_extension, has_suspicious_user_agent, is_useful_ip
@@ -49,6 +52,11 @@ def _http(offset_s, src="10.0.0.5", dst="93.184.216.34", host="example.com", pat
 def _file(offset_s, data, src="93.184.216.34", dst="10.0.0.5"):
     return ExtractedFile(src_ip=src, dst_ip=dst, filename=None, size=len(data), data=data,
                           timestamp=T0 + timedelta(seconds=offset_s))
+
+
+def _tcp(offset_s, src, dst, sport, dport, flags, length=60):
+    return PacketRecord(index=0, timestamp=T0 + timedelta(seconds=offset_s), src_ip=src, dst_ip=dst,
+                         src_port=sport, dst_port=dport, protocol="TCP", length=length, tcp_flags=flags)
 
 
 def _capture(dns=None, http=None, files=None, packets=None):
@@ -141,10 +149,60 @@ class TestDGAScoring(unittest.TestCase):
         self.assertLess(result.score, 30)
 
 
-class TestAggregation(unittest.TestCase):
+class TestPublicSuffixes(unittest.TestCase):
+    def test_co_ke_apex_domain_resolved_correctly(self):
+        from analyzer.public_suffixes import apex_domain
+        self.assertEqual(apex_domain("mail.example.co.ke"), "example.co.ke")
+        self.assertEqual(apex_domain("www.safaricom.co.ke"), "safaricom.co.ke")
+
+    def test_simple_tld_unaffected(self):
+        from analyzer.public_suffixes import apex_domain
+        self.assertEqual(apex_domain("beacon.example.com"), "example.com")
+
+    def test_unrelated_co_ke_businesses_do_not_merge_under_dns007(self):
+        # Without PSL-awareness, "one.co.ke" and "two.co.ke" would both
+        # collapse into apex "co.ke" and look like one business with
+        # many subdomains. With it, they must stay separate.
+        records = [_dns(i, query=f"sub{i}.businessone.co.ke") for i in range(4)]
+        records += [_dns(i, query=f"sub{i}.businesstwo.co.ke") for i in range(4)]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        subdomain_signals = [d for d in detections if d.rule_id == "DNS-007"]
+        # Neither apex individually has enough unique subdomains (4 each,
+        # threshold 6) to fire -- proving they were NOT merged into one
+        # "co.ke" apex with 8 combined unique subdomains.
+        self.assertEqual(len(subdomain_signals), 0)
+
+    def test_custom_suffix_via_config(self):
+        from analyzer.public_suffixes import apex_domain
+        config = {"dns": {"custom_public_suffixes": ["example.custom.tld"]}}
+        self.assertEqual(apex_domain("host.mybiz.example.custom.tld", config), "mybiz.example.custom.tld")
+
+
+class TestPerformance(unittest.TestCase):
+    def test_large_capture_completes_quickly(self):
+        import time
+        records = []
+        for i in range(3000):
+            records.append(_dns(i * 0.01, src=f"10.0.{i % 20}.{i % 250}", query=f"host{i % 50}.example.com"))
+        capture = _capture(dns=records)
+        start = time.time()
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        findings, _ = correlate(capture, iocs, agg, detections, {})
+        elapsed = time.time() - start
+        # 3000 raw observations should aggregate down to a small number
+        # of distinct (source, domain) buckets and complete well under a
+        # few seconds -- no O(n^2) blowup anywhere in the pipeline.
+        self.assertLessEqual(len(agg.dns_events), 20 * 50)
+        self.assertLess(elapsed, 5.0)
+
+
+
     def test_repeated_dns_queries_aggregate_into_one_event(self):
         records = [_dns(i, query="beacon.example.com") for i in range(5)]
-        events = aggregate_dns(_capture(dns=records))
+        events, _ = aggregate_dns(_capture(dns=records))
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].occurrence_count, 5)
 
@@ -154,7 +212,7 @@ class TestAggregation(unittest.TestCase):
             _dns(1, src="8.8.8.8", query="example.com", is_response=True,
                  resolved=["93.184.216.34"], rcode="NOERROR"),
         ]
-        events = aggregate_dns(_capture(dns=records))
+        events, _ = aggregate_dns(_capture(dns=records))
         self.assertEqual(len(events), 1)
         self.assertIn("93.184.216.34", events[0].resolved_ips)
 
@@ -162,8 +220,26 @@ class TestAggregation(unittest.TestCase):
         records = [_dns(i, query="ghost.example.com") for i in range(4)]
         records += [_dns(i, src="8.8.8.8", query="ghost.example.com", is_response=True,
                           rcode="NXDOMAIN") for i in range(4)]
-        events = aggregate_dns(_capture(dns=records))
+        events, _ = aggregate_dns(_capture(dns=records))
         self.assertEqual(events[0].nxdomain_ratio, 1.0)
+
+    def test_dns_transaction_id_pairs_precisely(self):
+        # Two different clients querying the same domain with distinct
+        # transaction IDs should NOT have their resolved IPs cross-merged.
+        records = [
+            DNSRecord(timestamp=T0, src_ip="10.0.0.5", dns_server="8.8.8.8", query="shared.example.com",
+                      query_type="A", is_response=False, transaction_id=111),
+            DNSRecord(timestamp=T0, src_ip="10.0.0.6", dns_server="8.8.8.8", query="shared.example.com",
+                      query_type="A", is_response=False, transaction_id=222),
+            DNSRecord(timestamp=T0, src_ip="8.8.8.8", dns_server=None, query="shared.example.com",
+                      query_type="A", is_response=True, resolved_ips=["1.1.1.1"], transaction_id=111),
+            DNSRecord(timestamp=T0, src_ip="8.8.8.8", dns_server=None, query="shared.example.com",
+                      query_type="A", is_response=True, resolved_ips=["2.2.2.2"], transaction_id=222),
+        ]
+        events, _ = aggregate_dns(_capture(dns=records))
+        by_client = {ev.source_ip: ev for ev in events}
+        self.assertEqual(by_client["10.0.0.5"].resolved_ips, {"1.1.1.1"})
+        self.assertEqual(by_client["10.0.0.6"].resolved_ips, {"2.2.2.2"})
 
     def test_repeated_http_requests_aggregate(self):
         records = [_http(i, path=f"/page{i}", ua="python-requests/2.31.0") for i in range(4)]
@@ -216,6 +292,68 @@ class TestDetectorDNS(unittest.TestCase):
         detections = run_detections(agg)
         self.assertTrue(any(d.rule_id == "DNS-002" for d in detections))
 
+    def test_rare_domain_is_informational_only(self):
+        records = [_dns(0, query="onlyonce.example.com")]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        rare = [d for d in detections if d.rule_id == "DNS-004"]
+        self.assertEqual(len(rare), 1)
+        self.assertEqual(rare[0].severity, "Informational")
+
+    def test_newly_observed_domain_flagged_when_not_in_history(self):
+        records = [_dns(0, query="brandnew.example.com")]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg, known_domains={"other.example.com"})
+        self.assertTrue(any(d.rule_id == "DNS-005" for d in detections))
+
+    def test_known_domain_not_flagged_as_newly_observed(self):
+        records = [_dns(0, query="familiar.example.com")]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg, known_domains={"familiar.example.com"})
+        self.assertFalse(any(d.rule_id == "DNS-005" for d in detections))
+
+    def test_dns_005_disabled_without_known_domains(self):
+        records = [_dns(0, query="whatever.example.com")]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg, known_domains=None)
+        self.assertFalse(any(d.rule_id == "DNS-005" for d in detections))
+
+    def test_dns_tunneling_indicators_fire_on_long_labels_and_txt(self):
+        long_label = "a" * 40
+        records = []
+        for i in range(10):
+            records.append(_dns(i, query=f"{long_label}{i}.tunnel.example.com", qtype="TXT"))
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "DNS-006" for d in detections))
+
+    def test_short_subdomains_do_not_trigger_tunneling(self):
+        # Plenty of short, ordinary CDN-style subdomains should NOT be
+        # flagged as tunneling (only as DNS-007 excessive-subdomains, if
+        # even that threshold is crossed).
+        records = [_dns(i, query=f"cdn{i}.example.com") for i in range(10)]
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "DNS-006" for d in detections))
+
+    def test_fast_flux_detected_for_many_distinct_ips_in_short_window(self):
+        records = [_dns(0, query="fastflux.example.com")]
+        for i in range(5):
+            records.append(_dns(i * 10, src="8.8.8.8", query="fastflux.example.com",
+                                 is_response=True, resolved=[f"10.9.{i}.1"], rcode="NOERROR"))
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "DNS-008" for d in detections))
+
+    def test_fast_flux_not_flagged_when_spread_over_long_window(self):
+        records = [_dns(0, query="slowchange.example.com")]
+        for i in range(5):
+            records.append(_dns(i * 1000, src="8.8.8.8", query="slowchange.example.com",
+                                 is_response=True, resolved=[f"10.9.{i}.1"], rcode="NOERROR"))
+        agg = aggregate(_capture(dns=records))
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "DNS-008" for d in detections))
+
 
 class TestDetectorHTTP(unittest.TestCase):
     def test_python_requests_alone_is_not_a_major_signal(self):
@@ -240,6 +378,38 @@ class TestDetectorHTTP(unittest.TestCase):
         exe_signal = next(d for d in detections if d.rule_id == "HTTP-001")
         # Suspicious UA present on the same request escalates severity.
         self.assertEqual(exe_signal.severity, "High")
+
+    def test_suspicious_download_source_fires_for_rare_unallowlisted_host(self):
+        records = [_http(0, host="rare-host.xyz", dst="185.10.10.10", path="/payload.exe")]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "HTTP-005" for d in detections))
+
+    def test_mime_mismatch_flagged_when_exe_served_as_benign_type(self):
+        capture = _capture(http=[
+            _http(0, host="evil.example.com", dst="185.10.10.10", path="/update.exe"),
+            HTTPRecord(timestamp=T0, src_ip="185.10.10.10", dst_ip="10.0.0.5",
+                       content_type="text/html", status_code="200"),
+        ])
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "HTTP-006" for d in detections))
+
+    def test_no_mime_mismatch_when_content_type_matches_executable(self):
+        capture = _capture(http=[
+            _http(0, host="evil.example.com", dst="185.10.10.10", path="/update.exe"),
+            HTTPRecord(timestamp=T0, src_ip="185.10.10.10", dst_ip="10.0.0.5",
+                       content_type="application/octet-stream", status_code="200"),
+        ])
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "HTTP-006" for d in detections))
+
+    def test_repeated_payload_retrieval_fires_for_non_executable_repeats(self):
+        records = [_http(i, path="/config.json") for i in range(4)]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "HTTP-007" for d in detections))
 
 
 class TestTIInterpretation(unittest.TestCase):
@@ -352,6 +522,251 @@ class TestCorrelation(unittest.TestCase):
         for f in findings:
             self.assertNotIn(f.severity, ("Critical",))
 
+    def test_asset_criticality_raises_risk_and_is_reported(self):
+        from analyzer.assets import AssetProfile
+        records = [_dns(i, query="qzxjklmpwvbnfgh.top") for i in range(15)]
+        capture = _capture(dns=records)
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        assets = {"10.0.0.5": AssetProfile(ip="10.0.0.5", hostname="DC01",
+                                             role="Domain Controller", criticality="Critical")}
+        findings_plain, _ = correlate(capture, iocs, agg, detections, {})
+        findings_with_asset, _ = correlate(capture, iocs, agg, detections, {}, assets=assets)
+        self.assertGreater(findings_with_asset[0].risk_score, findings_plain[0].risk_score)
+        self.assertTrue(any("DC01" in note for note in findings_with_asset[0].asset_notes))
+
+    def test_unknown_asset_reports_no_asset_notes(self):
+        records = [_dns(i, query="qzxjklmpwvbnfgh.top") for i in range(15)]
+        capture = _capture(dns=records)
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        findings, _ = correlate(capture, iocs, agg, detections, {})
+        self.assertEqual(findings[0].asset_notes, [])
+
+
+class TestNetworkScanning(unittest.TestCase):
+    def _port_scan_capture(self, n_ports=20, success=0):
+        packets = []
+        for i in range(n_ports):
+            packets.append(_tcp(i, "10.0.0.9", "10.0.0.50", 40000 + i, 1000 + i, "S"))
+            if i < success:
+                packets.append(_tcp(i + 0.1, "10.0.0.50", "10.0.0.9", 1000 + i, 40000 + i, "SA"))
+            else:
+                packets.append(_tcp(i + 0.1, "10.0.0.50", "10.0.0.9", 1000 + i, 40000 + i, "R"))
+        return _capture(packets=packets)
+
+    def test_port_scan_detected(self):
+        capture = self._port_scan_capture()
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "NET-001" for d in detections))
+
+    def test_normal_traffic_not_flagged_as_port_scan(self):
+        # A handful of successful connections to a couple of ports should
+        # never look like scanning.
+        packets = [
+            _tcp(0, "10.0.0.9", "10.0.0.50", 40000, 443, "S"),
+            _tcp(0.1, "10.0.0.50", "10.0.0.9", 443, 40000, "SA"),
+            _tcp(1, "10.0.0.9", "10.0.0.50", 40001, 80, "S"),
+            _tcp(1.1, "10.0.0.50", "10.0.0.9", 80, 40001, "SA"),
+        ]
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id in ("NET-001", "NET-002") for d in detections))
+
+    def test_host_scan_detected(self):
+        packets = []
+        for i in range(15):
+            dst = f"10.0.1.{i}"
+            packets.append(_tcp(i, "10.0.0.9", dst, 40000, 22, "S"))
+            packets.append(_tcp(i + 0.1, dst, "10.0.0.9", 22, 40000, "R"))
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "NET-002" for d in detections))
+
+    def test_repeated_auth_port_attempts_flagged(self):
+        packets = []
+        for i in range(8):
+            packets.append(_tcp(i, "10.0.0.9", "10.0.0.50", 41000 + i, 22, "S"))
+            packets.append(_tcp(i + 0.1, "10.0.0.50", "10.0.0.9", 22, 41000 + i, "R"))
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        auth_signals = [d for d in detections if d.rule_id == "NET-003"]
+        self.assertEqual(len(auth_signals), 1)
+        self.assertIn("SSH", auth_signals[0].explanation)
+
+    def test_few_retries_ending_in_success_not_flagged_as_brute_force(self):
+        # 2 SYN retransmits then a normal successful SSH session -- this
+        # is ordinary network behavior, not brute-forcing.
+        packets = [
+            _tcp(0, "10.0.0.9", "10.0.0.50", 41000, 22, "S"),
+            _tcp(0.2, "10.0.0.9", "10.0.0.50", 41000, 22, "S"),
+            _tcp(0.4, "10.0.0.50", "10.0.0.9", 22, 41000, "SA"),
+        ]
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "NET-003" for d in detections))
+
+
+class TestExfiltration(unittest.TestCase):
+    def test_asymmetric_outbound_volume_flagged(self):
+        packets = [
+            _tcp(0, "10.0.0.9", "185.53.90.14", 41000, 443, "S", length=60),
+            _tcp(0.1, "185.53.90.14", "10.0.0.9", 443, 41000, "SA", length=60),
+            _tcp(0.2, "10.0.0.9", "185.53.90.14", 41000, 443, "A", length=250000),
+        ]
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "NET-004" for d in detections))
+
+    def test_small_transfer_not_flagged(self):
+        packets = [
+            _tcp(0, "10.0.0.9", "185.53.90.14", 41000, 443, "S", length=60),
+            _tcp(0.1, "185.53.90.14", "10.0.0.9", 443, 41000, "SA", length=60),
+            _tcp(0.2, "10.0.0.9", "185.53.90.14", 41000, 443, "A", length=500),
+        ]
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "NET-004" for d in detections))
+
+    def test_internal_destination_not_flagged(self):
+        packets = [
+            _tcp(0, "10.0.0.9", "10.0.0.200", 41000, 445, "S", length=60),
+            _tcp(0.1, "10.0.0.200", "10.0.0.9", 445, 41000, "SA", length=60),
+            _tcp(0.2, "10.0.0.9", "10.0.0.200", 41000, 445, "A", length=250000),
+        ]
+        capture = _capture(packets=packets)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "NET-004" for d in detections))
+
+
+class TestBeaconing(unittest.TestCase):
+    def test_regular_interval_flagged(self):
+        stats = compute_interval_stats([T0 + timedelta(seconds=60 * i) for i in range(8)])
+        self.assertIsNotNone(stats)
+        self.assertTrue(stats.is_regular)
+
+    def test_irregular_interval_not_flagged(self):
+        offsets = [0, 3, 47, 12, 90, 5, 61, 200]
+        stats = compute_interval_stats([T0 + timedelta(seconds=o) for o in offsets])
+        self.assertIsNotNone(stats)
+        self.assertFalse(stats.is_regular)
+
+    def test_too_few_occurrences_returns_none(self):
+        self.assertIsNone(compute_interval_stats([T0, T0 + timedelta(seconds=1)]))
+
+    def test_beacon_rule_fires_for_regular_http(self):
+        records = [_http(60 * i, host="c2.example.com", dst="185.53.90.14") for i in range(8)]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "BEACON-001" for d in detections))
+
+    def test_beacon_rule_does_not_fire_for_irregular_http(self):
+        offsets = [0, 3, 47, 12, 90, 5, 61, 200]
+        records = [_http(o, host="normal.example.com", dst="185.53.90.14") for o in offsets]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "BEACON-001" for d in detections))
+
+
+class TestWebAttackPatterns(unittest.TestCase):
+    def test_sql_injection_pattern_matches(self):
+        self.assertIsNotNone(match_path("/login?user=admin' OR 1=1--"))
+
+    def test_benign_query_does_not_match(self):
+        self.assertIsNone(match_path("/search?q=blue+shoes"))
+
+    def test_single_match_does_not_flag_finding(self):
+        records = [_http(0, path="/login?id=1' OR 1=1--")]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertFalse(any(d.rule_id == "HTTP-008" for d in detections))
+
+    def test_repeated_match_flags_finding(self):
+        records = [_http(i, path=f"/login?id={i}' OR 1=1--") for i in range(4)]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "HTTP-008" for d in detections))
+
+    def test_path_traversal_repeated_flags_finding(self):
+        records = [_http(i, path=f"/files?p=../../../../etc/passwd{i}") for i in range(4)]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        self.assertTrue(any(d.rule_id == "HTTP-008" for d in detections))
+
+
+class TestMitreMapping(unittest.TestCase):
+    def test_known_rule_has_technique(self):
+        technique = get_technique("HTTP-001")
+        self.assertIsNotNone(technique)
+        self.assertEqual(technique.technique_id, "T1105")
+
+    def test_unmapped_rule_returns_none(self):
+        self.assertIsNone(get_technique("NOT-A-REAL-RULE"))
+
+    def test_detection_signal_annotated_with_mitre(self):
+        records = [_http(0, path="/payload.exe", ua="python-requests/2.31.0")]
+        agg = aggregate(_capture(http=records))
+        detections = run_detections(agg)
+        exe_signal = next(d for d in detections if d.rule_id == "HTTP-001")
+        self.assertEqual(exe_signal.mitre_technique_id, "T1105")
+
+
+class TestEvidenceFamilyCapping(unittest.TestCase):
+    def test_many_dns_signals_capped_below_full_sum(self):
+        records = [_dns(i, query="qzxjklmpwvbnfgh.top") for i in range(15)]
+        capture = _capture(dns=records)
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        dns_signals = [d for d in detections if d.category == "DNS" and not d.suppressed]
+        naive_sum = sum(d.score for d in dns_signals)
+        findings, _ = correlate(capture, iocs, agg, detections, {})
+        category_cap = DEFAULT_CONFIG["risk"]["category_caps"]["DNS"]
+        if naive_sum > category_cap:
+            self.assertLessEqual(findings[0].risk_score, category_cap +
+                                  DEFAULT_CONFIG["risk"]["weights"]["network_context"] +
+                                  DEFAULT_CONFIG["risk"]["weights"]["asset_context"])
+
+
+class TestIncidentReconstruction(unittest.TestCase):
+    def test_multiple_findings_same_endpoint_grouped_into_one_incident(self):
+        dns = [_dns(i, src="10.0.0.9", query="qzxjklmpwvbnfgh.top") for i in range(15)]
+        packets = []
+        for i in range(20):
+            packets.append(_tcp(i, "10.0.0.9", "10.0.0.50", 40000 + i, 1000 + i, "S"))
+            packets.append(_tcp(i + 0.1, "10.0.0.50", "10.0.0.9", 1000 + i, 40000 + i, "R"))
+        capture = _capture(dns=dns, packets=packets)
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        findings, _ = correlate(capture, iocs, agg, detections, {})
+        incidents = build_incidents(findings)
+        matching = [inc for inc in incidents if inc.affected_assets == ["10.0.0.9"]]
+        self.assertEqual(len(matching), 1)
+
+    def test_unrelated_endpoints_stay_separate_incidents(self):
+        dns = [_dns(i, src="10.0.0.5", query="qzxjklmpwvbnfgh.top") for i in range(15)]
+        dns += [_dns(i, src="10.0.0.6", query="anotherdgalike999.top") for i in range(15)]
+        capture = _capture(dns=dns)
+        iocs = extract_iocs(capture)
+        agg = aggregate(capture)
+        detections = run_detections(agg)
+        findings, _ = correlate(capture, iocs, agg, detections, {})
+        incidents = build_incidents(findings)
+        endpoints = {inc.affected_assets[0] for inc in incidents}
+        self.assertIn("10.0.0.5", endpoints)
+        self.assertIn("10.0.0.6", endpoints)
+
 
 class TestIOCScoring(unittest.TestCase):
     def test_iocs_without_evidence_are_insignificant(self):
@@ -415,7 +830,7 @@ class TestReporting(unittest.TestCase):
         with open(tmp_path) as fh:
             content = fh.read()
         self.assertIn("## 1. Executive Summary", content)
-        self.assertIn("## 2. Key Findings", content)
+        self.assertIn("## 3. Incidents & Key Findings", content)
         os.remove(tmp_path)
 
 

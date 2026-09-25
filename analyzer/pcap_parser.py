@@ -37,6 +37,7 @@ class PacketRecord:
     dst_port: Optional[int] = None
     protocol: Optional[str] = None
     length: int = 0
+    tcp_flags: Optional[str] = None  # e.g. "S", "SA", "R", "FA" -- raw Scapy flag string
 
 
 @dataclass
@@ -49,6 +50,7 @@ class DNSRecord:
     is_response: bool
     resolved_ips: List[str] = field(default_factory=list)
     response_code: Optional[str] = None  # NOERROR / NXDOMAIN / SERVFAIL / ... (responses only)
+    transaction_id: Optional[int] = None  # DNS header ID -- used to pair query <-> response precisely
 
 
 @dataclass
@@ -93,6 +95,22 @@ class ParsedCapture:
             counts[p.protocol or "OTHER"] = counts.get(p.protocol or "OTHER", 0) + 1
         return counts
 
+    def duration_seconds(self) -> float:
+        if not self.packets:
+            return 0.0
+        timestamps = [p.timestamp for p in self.packets]
+        return max((max(timestamps) - min(timestamps)).total_seconds(), 0.0)
+
+    def internal_ips(self) -> set:
+        from utils.networking import is_useful_ip
+        ips = {p.src_ip for p in self.packets if p.src_ip} | {p.dst_ip for p in self.packets if p.dst_ip}
+        return {ip for ip in ips if not is_useful_ip(ip)}
+
+    def external_ips(self) -> set:
+        from utils.networking import is_useful_ip
+        ips = {p.src_ip for p in self.packets if p.src_ip} | {p.dst_ip for p in self.packets if p.dst_ip}
+        return {ip for ip in ips if is_useful_ip(ip)}
+
 
 DNS_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"}
 DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
@@ -127,6 +145,10 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                 record.protocol = "TCP"
                 record.src_port = int(pkt[TCP].sport)
                 record.dst_port = int(pkt[TCP].dport)
+                try:
+                    record.tcp_flags = str(pkt[TCP].flags)
+                except Exception:
+                    record.tcp_flags = None
             elif UDP in pkt:
                 record.protocol = "UDP"
                 record.src_port = int(pkt[UDP].sport)
@@ -156,6 +178,12 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                 except Exception:
                     pass
 
+            transaction_id = None
+            try:
+                transaction_id = int(dns_layer.id)
+            except Exception:
+                pass
+
             resolved = []
             if is_response and dns_layer.ancount:
                 an = dns_layer.an
@@ -179,6 +207,7 @@ def parse_pcap(pcap_path: str, logger=None) -> ParsedCapture:
                 is_response=is_response,
                 resolved_ips=[ip for ip in resolved if ip],
                 response_code=response_code,
+                transaction_id=transaction_id,
             ))
 
         # --- HTTP (Scapy's http layer, when it recognises the stream) ---

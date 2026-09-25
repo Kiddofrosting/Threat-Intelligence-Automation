@@ -15,9 +15,3 @@ cache/*/*.json
 
 # OS
 .DS_Store
-
-# Local/generated threat intelligence artifacts
-*.gitkeep
-*.json
-*.pcap
-*.yaml

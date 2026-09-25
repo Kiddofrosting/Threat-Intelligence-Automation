@@ -22,6 +22,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "nxdomain_ratio_threshold": 0.5,
         "nxdomain_min_occurrences": 4,
         "excessive_subdomain_threshold": 6,
+        "rare_domain_occurrence_threshold": 2,
+        "tunneling_min_subdomains": 8,
+        "tunneling_avg_label_length_threshold": 30,
+        "tunneling_txt_null_ratio_threshold": 0.3,
+        "fastflux_min_distinct_ips": 4,
+        "fastflux_window_seconds": 600,
+        "newly_observed_enabled": True,
+        "custom_public_suffixes": [],
     },
     "http": {
         "suspicious_extensions": [
@@ -36,11 +44,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ],
         "rare_host_occurrence_threshold": 2,
         "repeated_payload_threshold": 3,
+        "executable_mime_types": [
+            "application/x-msdownload", "application/octet-stream",
+            "application/x-executable", "application/vnd.microsoft.portable-executable",
+            "application/x-dosexec",
+        ],
+        "benign_mime_prefixes": ["text/", "image/", "application/json", "application/xml"],
+        "web_attack_min_repetitions": 3,
     },
     "ti": {
         "abuseipdb": {"malicious_score": 75, "suspicious_score": 25, "stale_after_days": 365},
         "virustotal": {"malicious_vendor_count": 5, "weak_single_hit_min_total": 30},
         "urlhaus": {"stale_after_days": 730},
+    },
+    "network": {
+        "port_scan_min_distinct_ports": 15,
+        "port_scan_max_success_ratio": 0.2,
+        "host_scan_min_distinct_ips": 10,
+        "host_scan_max_success_ratio": 0.2,
+        "auth_port_min_attempts": 5,
+        "auth_port_max_success_ratio": 0.3,
+        "exfil_min_outbound_bytes": 200000,
+        "exfil_min_outbound_ratio": 5.0,
+    },
+    "beaconing": {
+        "min_occurrences": 5,
+        "max_coefficient_of_variation": 0.35,
     },
     "risk": {
         "weights": {
@@ -49,6 +78,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "severity_bands": {"Critical": 85, "High": 65, "Medium": 40, "Low": 20},
         "caps": {"behavior_only_max_severity": "Medium"},
+        "asset_criticality_weights": {
+            "Unknown": 0, "Low": 2, "Medium": 4, "High": 7, "Critical": 10,
+        },
+        # Evidence-family caps within the Behavior dimension: multiple
+        # signals of the SAME category (e.g. three DNS rules all firing
+        # for the same beaconing domain) are capped per-category before
+        # being summed, so restating one underlying behavior three ways
+        # doesn't triple its weight. The category sum is still subject
+        # to the overall "behavior" weight cap above.
+        "category_caps": {
+            "DNS": 14, "HTTP": 14, "File": 16, "Network": 14, "Behavioral": 10,
+        },
     },
     "correlation": {
         "time_window_seconds": 900,
